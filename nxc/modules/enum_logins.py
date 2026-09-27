@@ -1,4 +1,7 @@
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -12,76 +15,60 @@ class NXCModule:
     supported_protocols = ["mssql"]
     category = CATEGORY.ENUMERATION
 
-    def __init__(self):
-        self.mssql_conn = None
-        self.context = None
+    @dataclass
+    class ResultData:
+        default_domain: str | None
+        logins: list[dict]
 
-    def on_login(self, context, connection):
-        self.context = context
-        self.mssql_conn = connection.conn
-
-        logins = self.get_logins()
-        if logins:
-            self.context.log.display("Enumerated logins")
-            self.context.log.highlight(f"{'Login Name':<35} {'Type':<15} {'Status'}")
-            self.context.log.highlight(f"{'----------':<35} {'----':<15} {'------'}")
-            for login_name, login_type, status in logins:
-                self.context.log.highlight(f"{login_name:<35} {login_type:<15} {status}")
-        else:
-            self.context.log.fail("No logins found.")
-
-    def get_domain_name(self) -> str:
-        query = "SELECT DEFAULT_DOMAIN() as domain_name;"
-        try:
-            res = self.mssql_conn.sql_query(query)
-            if res and res[0].get("domain_name"):
-                return res[0]["domain_name"].upper()
-            return ""
-        except Exception as e:
-            self.context.log.debug(f"Error querying domain name: {e}")
-            return ""
-
-    def get_logins(self) -> list:
-        domain_name = self.get_domain_name()
-        domain_prefix = f"{domain_name}\\" if domain_name else ""
-
-        query = f"""
-        SELECT
-            name,
-            type,
-            type_desc,
-            CASE type_desc
-                WHEN 'SQL_LOGIN' THEN 'SQL User'
-                WHEN 'WINDOWS_LOGIN' THEN
-                    CASE
-                        WHEN name LIKE '{domain_prefix}%' THEN 'Domain User'
-                        WHEN name LIKE '%\\%' THEN 'Local User'
-                        ELSE 'Local User'
-                    END
-                WHEN 'WINDOWS_GROUP' THEN 'Windows Group'
-                WHEN 'CERTIFICATE_MAPPED_LOGIN' THEN 'Certificate Login'
-                WHEN 'ASYMMETRIC_KEY_MAPPED_LOGIN' THEN 'Asymmetric Key Login'
-                ELSE type_desc
-            END as login_type,
-            is_disabled,
-            create_date
-        FROM sys.server_principals
-        WHERE type IN ('S', 'U', 'G', 'C', 'K')
-        AND name NOT LIKE '##%'
-        ORDER BY login_type, name;
-        """
-        try:
-            res = self.mssql_conn.sql_query(query)
-            if res:
-                logins = []
-                for login in res:
-                    status = "DISABLED" if login.get("is_disabled") else "ENABLED"
-                    logins.append((login["name"], login["login_type"], status))
-                return logins
-            return []
-        except Exception as e:
-            self.context.log.fail(f"Error querying logins: {e}")
-            return []
+    result_type = ResultData
 
     def options(self, context, module_options):
         pass
+
+    def on_login(self, context, connection):
+        errors = []
+        domain = None
+        logins = []
+        try:
+            rows = connection.conn.sql_query("SELECT DEFAULT_DOMAIN() as domain_name;")
+            if connection.conn.lastError:
+                errors.append(str(connection.conn.lastError))
+            elif rows:
+                domain = rows[0].get("domain_name")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        try:
+            rows = connection.conn.sql_query("""
+                SELECT name, type, type_desc, is_disabled, create_date
+                FROM sys.server_principals
+                WHERE type IN ('S', 'U', 'G', 'C', 'K') AND name NOT LIKE '##%'
+                ORDER BY type_desc, name;
+            """) or []
+            if connection.conn.lastError:
+                errors.append(str(connection.conn.lastError))
+            for row in rows:
+                login = dict(row)
+                login["login_type"] = self.login_type(row, domain)
+                logins.append(login)
+                status = "UNKNOWN" if row.get("is_disabled") is None else "DISABLED" if row["is_disabled"] else "ENABLED"
+                context.log.highlight(f"{row['name']:<35} {login['login_type']:<15} {status}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        for error in errors:
+            context.log.fail(error)
+        if not logins and not errors:
+            context.log.display("No logins found.")
+        return ActionResult(
+            "mssql", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if logins else ResultStatus.NEGATIVE,
+            self.ResultData(domain, logins), error="; ".join(errors) or None,
+        )
+
+    def login_type(self, row, domain):
+        types = {"SQL_LOGIN": "SQL User", "WINDOWS_GROUP": "Windows Group", "CERTIFICATE_MAPPED_LOGIN": "Certificate Login", "ASYMMETRIC_KEY_MAPPED_LOGIN": "Asymmetric Key Login"}
+        if row.get("type_desc") == "WINDOWS_LOGIN":
+            if domain and row["name"].casefold().startswith(domain.casefold() + "\\"):
+                return "Domain User"
+            # A non-default prefix may be a local machine or another domain.
+            return "Windows User"
+        return types.get(row.get("type_desc"), row.get("type_desc") or "Unknown")

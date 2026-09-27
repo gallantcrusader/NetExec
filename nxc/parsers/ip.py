@@ -37,10 +37,9 @@ def process_targets(args):
 
     # Process exclude_hosts from config. Important, we are reusing the parse_targets because it
     # already provides the code necessary for parsing all provided inputs
-    if args.exclude_hosts is not None:
-        exclude_hosts.extend(args.exclude_hosts)
+    exclusions = [*exclude_hosts, *(args.exclude_hosts or [])]
 
-    for excluded in exclude_hosts:
+    for excluded in exclusions:
         if Path(excluded).is_file():
             with open(excluded) as excluded_file:
                 for line in excluded_file.readlines():

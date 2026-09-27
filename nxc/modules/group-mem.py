@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from impacket.ldap import ldapasn1 as ldapasn1_impacket
 import sys
 from nxc.helpers.misc import CATEGORY
@@ -15,6 +16,7 @@ class NXCModule:
     description = "[REMOVED] Retrieves all the members within a Group"
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
+    result_type = RetiredModuleData
 
     primaryGroupID = ""
     answers = []
@@ -38,7 +40,7 @@ class NXCModule:
 
     def on_login(self, context, connection):
         context.log.fail("[REMOVED] Use the ldap flag '--groups \"Administrators\"' instead of the module group-mem.")
-        return None
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("action:groups"), error="[REMOVED] Use the ldap flag '--groups \"Administrators\"' instead of the module group-mem.")
 
         # First look up the SID of the group passed in
         search_filter = "(&(objectCategory=group)(cn=" + self.GROUP + "))"

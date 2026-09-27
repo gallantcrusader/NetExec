@@ -1,18 +1,29 @@
 from types import ModuleType
 from importlib.machinery import SourceFileLoader
+from hashlib import sha256
 from os import listdir
 from os.path import join as path_join
 from os.path import dirname, exists
+from threading import Lock
+import sys
 
 import nxc
 
 
 class ProtocolLoader:
+    module_cache = {}
+    cache_lock = Lock()
+
     def load_protocol(self, protocol_path):
-        loader = SourceFileLoader("protocol", protocol_path)
-        protocol = ModuleType(loader.name)
-        loader.exec_module(protocol)
-        return protocol
+        with self.cache_lock:
+            if protocol_path not in self.module_cache:
+                module_name = f"nxc_protocol_{sha256(protocol_path.encode()).hexdigest()[:16]}"
+                loader = SourceFileLoader(module_name, protocol_path)
+                protocol = ModuleType(module_name)
+                sys.modules[module_name] = protocol
+                loader.exec_module(protocol)
+                self.module_cache[protocol_path] = protocol
+            return self.module_cache[protocol_path]
 
     def get_protocols(self):
         protocols = {}

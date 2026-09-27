@@ -1,16 +1,10 @@
-from impacket.ldap import ldapasn1 as ldapasn1_impacket
-from impacket.ldap.ldap import LDAPSearchError
-import sys
+from dataclasses import dataclass
+from sys import exit
+
+from ldap3.utils.conv import escape_filter_chars
 from nxc.helpers.misc import CATEGORY
-
-
-def search_res_entry_to_dict(results):
-    data = {}
-    for attr in results["attributes"]:
-        key = str(attr["type"])
-        value = str(attr["vals"][0])
-        data[key] = value
-    return data
+from nxc.parsers.ldap_results import parse_result_attributes
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -25,86 +19,61 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        sites: list[dict]
+        servers_queried: bool
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """SHOWSERVERS    Toggle printing of servers (default: true)"""
         self.showservers = True
-
         if module_options and "SHOWSERVERS" in module_options:
-            if module_options["SHOWSERVERS"].lower() == "true" or module_options["SHOWSERVERS"] == "1":
+            if module_options["SHOWSERVERS"].lower() in {"true", "1"}:
                 self.showservers = True
-            elif module_options["SHOWSERVERS"].lower() == "false" or module_options["SHOWSERVERS"] == "0":
+            elif module_options["SHOWSERVERS"].lower() in {"false", "0"}:
                 self.showservers = False
             else:
                 context.log.fail("Could not parse showservers option for 'SHOWSERVERS'. Please use 'true' or 'false'.")
                 exit(1)
 
     def on_login(self, context, connection):
-        dn = connection.args.base_dn if connection.args.base_dn else connection.ldap_connection._baseDN
-
+        dn = connection.args.base_dn or connection.ldap_connection._baseDN
         context.log.display("Getting the Sites and Subnets from domain")
-
-        try:
-            list_sites = connection.ldap_connection.search(
-                searchBase=f"CN=Configuration,{dn}",
-                searchFilter="(objectClass=site)",
-                attributes=["distinguishedName", "name", "description"],
-                sizeLimit=999,
-            )
-        except LDAPSearchError as e:
-            context.log.fail(str(e))
-            sys.exit()
-
-        for site in list_sites:
-            if isinstance(site, ldapasn1_impacket.SearchResultEntry) is not True:
-                continue
-            site = search_res_entry_to_dict(site)
+        sites = parse_result_attributes(connection.search(
+            "(objectClass=site)", ["distinguishedName", "name", "description"], baseDN=f"CN=Configuration,{dn}",
+        ))
+        errors = [connection.last_search_error] if connection.last_search_error else []
+        records = []
+        for site in sites:
             site_dn = site["distinguishedName"]
-            site_name = site["name"]
-            site_description = ""
-            if "description" in site:
-                site_description = site["description"]
-
-            # Getting subnets of this site
-            list_subnets = connection.ldap_connection.search(
-                searchBase=f"CN=Sites,CN=Configuration,{dn}",
-                searchFilter=f"(siteObject={site_dn})",
-                attributes=["distinguishedName", "name"],
-                sizeLimit=999,
-            )
-            if len([subnet for subnet in list_subnets if isinstance(subnet, ldapasn1_impacket.SearchResultEntry)]) == 0:
-                context.log.highlight(f'Site "{site_name}"')
-            else:
-                for subnet in list_subnets:
-                    if isinstance(subnet, ldapasn1_impacket.SearchResultEntry) is not True:
-                        continue
-                    subnet = search_res_entry_to_dict(subnet)
-                    subnet["distinguishedName"]
-                    subnet_name = subnet["name"]
-
-                    if self.showservers:
-                        # Getting machines in these subnets
-                        list_servers = connection.ldap_connection.search(
-                            searchBase=site_dn,
-                            searchFilter="(objectClass=server)",
-                            attributes=["cn"],
-                            sizeLimit=999,
-                        )
-                        if len([server for server in list_servers if isinstance(server, ldapasn1_impacket.SearchResultEntry)]) == 0:
-                            if len(site_description) != 0:
-                                context.log.highlight(f'Site "{site_name}" (Subnet:{subnet_name}) (description:"{site_description}")')
-                            else:
-                                context.log.highlight(f'Site "{site_name}" (Subnet:{subnet_name})')
-                        else:
-                            for server in list_servers:
-                                if isinstance(server, ldapasn1_impacket.SearchResultEntry) is not True:
-                                    continue
-                                server = search_res_entry_to_dict(server)["cn"]
-                                if len(site_description) != 0:
-                                    context.log.highlight(f"Site: '{site_name}' (Subnet:{subnet_name}) (description:'{site_description}') (Server:'{server}')")
-                                else:
-                                    context.log.highlight(f'Site "{site_name}" (Subnet:{subnet_name}) (Server:{server})')
-                    else:
-                        if len(site_description) != 0:
-                            context.log.highlight(f'Site "{site_name}" (Subnet:{subnet_name}) (description:"{site_description}")')
-                        else:
-                            context.log.highlight(f'Site "{site_name}" (Subnet:{subnet_name})')
+            subnets = parse_result_attributes(connection.search(
+                f"(siteObject={escape_filter_chars(site_dn)})", ["distinguishedName", "name"], baseDN=f"CN=Sites,CN=Configuration,{dn}",
+            ))
+            if connection.last_search_error:
+                errors.append(connection.last_search_error)
+            servers = []
+            if self.showservers:
+                servers = parse_result_attributes(connection.search("(objectClass=server)", ["cn"], baseDN=site_dn))
+                if connection.last_search_error:
+                    errors.append(connection.last_search_error)
+            records.append({
+                "name": site["name"], "distinguished_name": site_dn, "description": site.get("description", ""),
+                "subnets": subnets, "servers": [server["cn"] for server in servers],
+            })
+            for subnet in subnets or [None]:
+                for server in servers or [None]:
+                    message = f'Site "{site["name"]}"'
+                    if subnet:
+                        message += f' (Subnet:{subnet["name"]})'
+                    if site.get("description"):
+                        message += f' (description:"{site["description"]}")'
+                    if server:
+                        message += f' (Server:{server["cn"]})'
+                    context.log.highlight(message)
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+            self.ResultData(records, self.showservers), error="; ".join(errors) if errors else None,
+        )

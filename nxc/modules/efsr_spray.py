@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from nxc.context import Context
 from nxc.helpers.misc import CATEGORY
 
@@ -8,6 +9,7 @@ class NXCModule:
     supported_protocols = ["smb"]
     excluded_shares = ["SYSVOL"]
     category = CATEGORY.PRIVILEGE_ESCALATION
+    result_type = RetiredModuleData
 
     def options(self, context: Context, module_options: dict[str, str]):
         """
@@ -18,3 +20,4 @@ class NXCModule:
 
     def on_login(self, context: Context, connection):
         context.log.fail('[REMOVED] This module has been made obsolete and EFS will be activated automatically by "coerce_plus"')
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("module:coerce_plus"), error='[REMOVED] This module has been made obsolete and EFS will be activated automatically by "coerce_plus"')

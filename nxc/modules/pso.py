@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from nxc.helpers.misc import CATEGORY
 
 
@@ -11,6 +12,7 @@ class NXCModule:
     description = "[REMOVED] This module moved to the core option --pso"
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
+    result_type = RetiredModuleData
 
     def __init__(self, context=None, module_options=None):
         self.context = context
@@ -21,3 +23,4 @@ class NXCModule:
 
     def on_login(self, context, connection):
         context.log.fail("[REMOVED] This module moved to the core option --pso")
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("action:pso"), error="[REMOVED] This module moved to the core option --pso")

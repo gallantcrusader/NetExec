@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from pathlib import Path
+
 import os
 import base64
 import binascii
@@ -15,6 +18,7 @@ from termcolor import colored
 from dploot.lib.network.winrm import WINRMTarget as Target
 from impacket.examples.secretsdump import LocalOperations, LSASecrets, SAMHashes
 
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection
 from nxc.helpers.bloodhound import add_user_bh
@@ -26,8 +30,26 @@ from nxc.logger import NXCAdapter
 urllib3.disable_warnings()
 
 
+@dataclass
+class WinRMCommandData:
+    command: str
+    shell: str
+    stdout: str
+    stderr: str
+    exit_status: int | None
+    had_errors: bool | None
+    streams: dict[str, list[str]]
+
+
+@dataclass
+class WinRMTransferData:
+    remote_path: str
+    local_path: Path
+    completed: bool
+
+
 class winrm(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.domain = ""
         self.targedDomain = ""
         self.server_os = None
@@ -43,7 +65,7 @@ class winrm(connection):
 
         self._dpapi_triage = None
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         # For more details, please check the function "print_host_info"
@@ -249,7 +271,43 @@ class winrm(connection):
                 self.logger.fail(f"{self.domain}\\{self.username}:{process_secret(self.nthash)} {e!s}")
             return False
 
+    def execute_result(self, command, shell, action):
+        data = WinRMCommandData(command, shell, "", "", None, None, {})
+        error = None
+        try:
+            response = self.conn.execute_cmd(command, encoding=self.args.codec) if shell == "cmd" else self.conn.execute_ps(command)
+            data.stdout = response[0]
+            if shell == "cmd":
+                data.stderr, data.exit_status = response[1:]
+                if data.exit_status != 0:
+                    error = f"Command exited with status {data.exit_status}"
+            else:
+                data.had_errors = response[2]
+                data.streams = {name: [str(item) for item in getattr(response[1], name)] for name in ("debug", "verbose", "information", "progress", "warning", "error")}
+                if data.had_errors or data.streams["error"]:
+                    error = "PowerShell reported errors"
+            if not self.args.no_output:
+                for line in data.stdout.splitlines():
+                    self.logger.highlight(line)
+                for line in data.stderr.splitlines():
+                    self.logger.display(line)
+                for name, messages in data.streams.items():
+                    for message in messages:
+                        self.logger.display(f"{name}: {message}")
+        except Exception as e:
+            if getattr(e, "code", None) == 5 and shell == "cmd":
+                self.logger.info("CMD invoke rights unavailable; attempting PowerShell")
+                return self.execute_result(command, "powershell", action)
+            error = str(e) or type(e).__name__
+        if error:
+            self.logger.fail(error)
+        else:
+            self.logger.success(f"Executed command (shell type: {shell})")
+        return ActionResult("winrm", action, self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, data, error=error)
+
     def execute(self, payload=None, get_output=False, shell_type="cmd"):
+        if self.playbook_mode and payload is None:
+            return self.execute_result(self.args.execute, shell_type, "execute")
         if not payload:
             payload = self.args.execute
 
@@ -298,15 +356,20 @@ class winrm(connection):
                             self.logger.fail(line.rstrip())
 
     def ps_execute(self, payload=None, get_output=False):
+        if self.playbook_mode and payload is None:
+            return self.execute_result(self.args.ps_execute, "powershell", "ps_execute")
         command = payload if payload else self.args.ps_execute
         result = self.execute(payload=command, get_output=get_output, shell_type="powershell")
         if get_output:
             return result
 
     def get_file(self, remote_path=None, download_path=None):
+        structured = self.playbook_mode and remote_path is None and download_path is None
         remote_path = remote_path if remote_path else self.args.get_file[0]
         local_path = download_path if download_path else self.args.get_file[1]
 
+        remote_path, local_path = str(remote_path), str(local_path)
+        error = None
         # Do a bit of smart handling for the local file path
         if local_path.endswith("/"):
             local_path += ntpath.basename(remote_path)
@@ -315,12 +378,18 @@ class winrm(connection):
             self.conn.fetch(remote_path, local_path)
             self.logger.success(f"File {remote_path} has been saved to {local_path}")
         except Exception as e:
+            error = str(e) or type(e).__name__
             self.logger.fail(f"Failed to get file {remote_path}, error: {e!s}")
+        if structured:
+            return ActionResult("winrm", "get_file", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, WinRMTransferData(remote_path, Path(local_path), error is None), artifacts=[Artifact(Path(local_path), "download")] if error is None else [], error=error)
 
     def put_file(self, local_path=None, remote_path=None):
+        structured = self.playbook_mode and local_path is None and remote_path is None
         local_path = local_path if local_path else self.args.put_file[0]
         remote_path = remote_path if remote_path else self.args.put_file[1]
 
+        local_path, remote_path = str(local_path), str(remote_path)
+        error = None
         # Do a bit of smart handling for the remote file path
         remote_path += os.path.basename(local_path) if remote_path.endswith(("\\", "/")) else ""
         try:
@@ -328,9 +397,14 @@ class winrm(connection):
             self.conn.copy(local_path, remote_path)
             self.logger.success(f"File {local_path} has been uploaded to {remote_path}")
         except Exception as e:
+            error = str(e) or type(e).__name__
             self.logger.fail(f"Failed to put file {local_path} to {remote_path}, error: {e!s}")
+        if structured:
+            return ActionResult("winrm", "put_file", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, WinRMTransferData(remote_path, Path(local_path), error is None), error=error)
 
     def dir(self, directory=None):
+        if self.playbook_mode and directory is None:
+            return self.execute_result(f"dir {self.args.dir or ''}", "cmd", "dir")
         directory = directory if directory else self.args.dir
         out = self.execute(f"dir {directory}", True)
         if out is not None:

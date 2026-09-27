@@ -1,3 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+
 import paramiko
 import os
 import re
@@ -5,6 +9,7 @@ import uuid
 import logging
 import time
 
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 from nxc.config import process_secret
 from nxc.connection import connection, highlight
 from nxc.logger import NXCAdapter
@@ -17,15 +22,36 @@ from paramiko.ssh_exception import (
 from nxc.protocols.ssh.keyfiles import is_key_type_rejected
 
 
+@dataclass
+class SSHCommandData:
+    command: str
+    stdout: bytes
+    stderr: bytes
+    exit_status: int | None
+
+
+@dataclass
+class SFTPTransfer:
+    source: str
+    destination: str
+    completed: bool
+    error: str | None = None
+
+
+@dataclass
+class SFTPTransferData:
+    transfers: list[SFTPTransfer]
+
+
 class ssh(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.protocol = "SSH"
         self.remote_version = "Unknown SSH Version"
         self.server_os_platform = "Linux"
         self.shell_access = False
         self.admin_privs = False
         self.uac = ""
-        super().__init__(args, db, host)
+        super().__init__(args, db, host, defer_flow=defer_flow)
 
     def proto_flow(self):
         self.logger.debug("Kicking off proto_flow")
@@ -323,6 +349,8 @@ class ssh(connection):
             self.logger.fail(f'Error writing file to "{dst}": {e}')
 
     def put_file(self):
+        if self.playbook_mode:
+            return self.transfer_files("put_file", self.args.put_file)
         sftp_conn = self.conn.open_sftp()
         for src, dest in self.args.put_file:
             self.put_file_single(sftp_conn, src, dest)
@@ -339,12 +367,98 @@ class ssh(connection):
                 os.remove(download_path)
 
     def get_file(self):
+        if self.playbook_mode:
+            return self.transfer_files("get_file", self.args.get_file)
         sftp_conn = self.conn.open_sftp()
         for src, dest in self.args.get_file:
             self.get_file_single(sftp_conn, src, dest)
         sftp_conn.close()
 
+    def transfer_files(self, action, pairs):
+        transfers = []
+        artifacts = []
+        errors = []
+        sftp = None
+        try:
+            sftp = self.conn.open_sftp()
+            for source, destination in pairs:
+                source, destination = str(source), str(destination)
+                transfer = SFTPTransfer(source, destination, False)
+                transfers.append(transfer)
+                try:
+                    if action == "get_file":
+                        sftp.get(source, destination)
+                        artifacts.append(Artifact(Path(destination), "download"))
+                    else:
+                        sftp.put(source, destination)
+                    transfer.completed = True
+                    self.logger.success(f"Transferred {source} to {destination}")
+                except Exception as e:
+                    transfer.error = str(e) or type(e).__name__
+                    errors.append(f"{source} -> {destination}: {transfer.error}")
+                    self.logger.fail(errors[-1])
+                    break
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        finally:
+            if sftp is not None:
+                try:
+                    sftp.close()
+                except Exception as e:
+                    errors.append(f"Closing SFTP session: {e}")
+        return ActionResult(
+            "ssh", action, self.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if transfers else ResultStatus.NEGATIVE,
+            SFTPTransferData(transfers), artifacts=artifacts, error="; ".join(errors) if errors else None,
+        )
+
+    def execute_result(self):
+        command = self.args.execute
+        outputs = {"stdout": b"", "stderr": b""}
+        exit_status = None
+        streams = []
+        errors = []
+        try:
+            stdin, stdout, stderr = self.conn.exec_command(command, timeout=self.args.ssh_timeout)
+            streams = [stdout, stderr, stdout.channel]
+            stdin.close()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                readers = {name: executor.submit(stream.read) for name, stream in (("stdout", stdout), ("stderr", stderr))}
+                for name, future in readers.items():
+                    try:
+                        outputs[name] = future.result()
+                    except Exception as e:
+                        errors.append(f"Reading {name}: {e}")
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == -1:
+                exit_status = None
+                errors.append("SSH server did not provide an exit status")
+            elif exit_status != 0:
+                errors.append(f"Command exited with status {exit_status}")
+            if not self.args.no_output:
+                for output in outputs.values():
+                    for line in output.decode(self.args.codec, errors="replace").splitlines():
+                        self.logger.highlight(line)
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        finally:
+            for stream in streams:
+                try:
+                    stream.close()
+                except Exception as e:
+                    errors.append(f"Closing command stream: {e}")
+        if errors:
+            self.logger.fail("; ".join(errors))
+        else:
+            self.logger.success("Executed command")
+        return ActionResult(
+            "ssh", "execute", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS,
+            SSHCommandData(command, outputs["stdout"], outputs["stderr"], exit_status), error="; ".join(errors) if errors else None,
+        )
+
     def execute(self, payload=None, get_output=False):
+        if self.playbook_mode and payload is None:
+            return self.execute_result()
         if not payload and self.args.execute:
             payload = self.args.execute
             if not self.args.no_output:

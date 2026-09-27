@@ -1,18 +1,41 @@
+from dataclasses import dataclass
 from io import BytesIO
-import os
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
+from pathlib import Path
+from nxc.paths import NXC_PATH
 from nxc.config import process_secret
 from nxc.connection import connection
 from nxc.helpers.logger import highlight
 from nxc.logger import NXCAdapter
-from ftplib import FTP, error_perm, error_temp
+from ftplib import FTP, error_perm, error_temp, all_errors as ftp_errors
+
+
+@dataclass
+class FTPListingData:
+    directory: str
+    lines: list[str]
+
+
+@dataclass
+class FTPContentData:
+    path: str
+    content: bytes
+
+
+@dataclass
+class FTPTransferData:
+    remote_path: str
+    local_path: Path
+    bytes_transferred: int
+    completed: bool
 
 
 class ftp(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.protocol = "FTP"
         self.welcome_banner = ""
 
-        super().__init__(args, db, host)
+        super().__init__(args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -69,43 +92,36 @@ class ftp(connection):
             else:
                 self.logger.success(f"{username}:{process_secret(password)}")
 
-        if self.args.ls:
-            # If the default directory is specified, then we will list the current directory
-            if self.args.ls == ".":
-                files = self.list_directory_full()
-                # If files is false, then we encountered an exception
-                if not files:
-                    return False
-                # If there are files, then we can list the files
-                self.logger.display("Directory Listing")
-                for file in files:
-                    self.logger.highlight(file)
-            else:
-                # If the default directory is not specified, then we will list the specified directory
-                self.logger.display(f"Directory Listing for {self.args.ls}")
-                # Change to the specified directory
-                try:
-                    self.conn.cwd(self.args.ls)
-                except error_perm as error_message:
-                    self.logger.fail(f"Failed to change directory. Response: ({error_message})")
-                    self.conn.close()
-                    return False
-                # List the files in the specified directory
-                files = self.list_directory_full()
-                for file in files:
-                    self.logger.highlight(file)
-
-        if self.args.get:
-            self.get_file(f"{self.args.get}")
-
-        if self.args.put:
-            self.put_file(self.args.put[0], self.args.put[1])
-
         if not self.args.continue_on_success:
             return True
 
     def disconnect(self):
         self.conn.close()
+
+    def ls(self):
+        directory = self.args.ls or "."
+        original_directory = None
+        lines = []
+        errors = []
+        try:
+            if directory != ".":
+                original_directory = self.conn.pwd()
+                self.conn.cwd(directory)
+            self.conn.retrlines("LIST -a", callback=lines.append)
+            self.logger.display(f"Directory Listing for {directory}")
+            for line in lines:
+                self.logger.highlight(line)
+        except (error_perm, error_temp, OSError) as e:
+            errors.append(str(e))
+            self.logger.fail(f"Failed to list directory: {e}")
+        finally:
+            if original_directory is not None:
+                try:
+                    self.conn.cwd(original_directory)
+                except (error_perm, error_temp, OSError) as e:
+                    errors.append(f"Restoring FTP directory: {e}")
+        if self.playbook_mode:
+            return ActionResult("ftp", "ls", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if lines else ResultStatus.NEGATIVE, FTPListingData(directory, lines), error="; ".join(errors) if errors else None)
 
     def list_directory_full(self):
         # in the future we can use mlsd/nlst if we want, but this gives a full output like `ls -la`
@@ -123,71 +139,80 @@ class ftp(connection):
             return False
         return files
 
+    def get(self):
+        return self.get_file(self.args.get)
+
+    def put(self):
+        return self.put_file(*self.args.put)
+
     def get_file(self, filename):
-        # Extract the filename from the path
-        downloaded_file = filename.split("/")[-1]
+        output = getattr(self.args, "get_output", None)
+        local_path = Path(output).expanduser() if output else Path(NXC_PATH) / "downloads" / "ftp" / self.host.replace(":", "_") / filename.split("/")[-1]
+        transferred = 0
+        created = False
+        error = None
         try:
-            # Check if the current connection is ASCII (ASCII does not support .size())
-            if self.conn.encoding == "utf-8":
-                # Switch the connection to binary
-                self.conn.sendcmd("TYPE I")
-            # Attempt to download the file
-            with open(downloaded_file, "wb") as f:
-                self.conn.retrbinary(f"RETR {filename}", f.write)
-        except error_perm as error_message:
-            self.logger.fail(f"Failed to download the file. Response: ({error_message})")
-            self.conn.close()
-            return False
-        except FileNotFoundError:
-            self.logger.fail("Failed to download the file. Response: (No such file or directory.)")
-            self.conn.close()
-            return False
-        # Check if the file was downloaded
-        if os.path.isfile(downloaded_file):
-            self.logger.success(f"Downloaded: {filename}")
-        else:
-            self.logger.fail(f"Failed to download: {filename}")
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_path.open("wb") as file:
+                created = True
+
+                def write_block(block):
+                    nonlocal transferred
+                    transferred += file.write(block)
+
+                self.conn.retrbinary(f"RETR {filename}", write_block)
+            self.logger.success(f"Downloaded: {filename} to {local_path}")
+        except ftp_errors as e:
+            error = str(e) or type(e).__name__
+            self.logger.fail(f"Failed to download {filename}: {error}")
+        if self.playbook_mode:
+            return ActionResult(
+                "ftp", "get", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS,
+                FTPTransferData(filename, local_path, transferred, error is None),
+                artifacts=[Artifact(local_path, "partial_download" if error else "download")] if created else [], error=error,
+            )
+        return False if error else None
 
     def put_file(self, local_file, remote_file):
+        local_path = Path(local_file).expanduser()
+        transferred = 0
+        error = None
+
+        def sent_block(block):
+            nonlocal transferred
+            transferred += len(block)
+
         try:
-            # Attempt to upload the file
-            with open(local_file, "rb") as f:
-                self.conn.storbinary(f"STOR {remote_file}", f.read)
-        except error_perm as error_message:
-            self.logger.fail(f"Failed to upload file. Response: ({error_message})")
-            return False
-        except FileNotFoundError:
-            self.logger.fail(f"Failed to upload file. {local_file} does not exist locally.")
-            return False
-        # Check if the file was uploaded
-        if self.conn.size(remote_file) is not None:
-            self.logger.success(f"Uploaded: {local_file} to {remote_file}")
-        else:
-            self.logger.fail(f"Failed to upload: {local_file} to {remote_file}")
+            with local_path.open("rb") as file:
+                self.conn.storbinary(f"STOR {remote_file}", file, callback=sent_block)
+            self.logger.success(f"Uploaded: {local_path} to {remote_file}")
+        except ftp_errors as e:
+            error = str(e) or type(e).__name__
+            self.logger.fail(f"Failed to upload {local_path}: {error}")
+        if self.playbook_mode:
+            return ActionResult("ftp", "put", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, FTPTransferData(remote_file, local_path, transferred, error is None), error=error)
+        return False if error else None
 
     def cat(self):
-        # Extract the filename from the path
         remote_file = self.args.cat
+        buf = BytesIO()
+        error = None
         try:
-            # Check if the current connection is ASCII (ASCII does not support .size())
             if self.conn.encoding == "utf-8":
-                # Switch the connection to binary
                 self.conn.sendcmd("TYPE I")
-            # Attempt to get the file content
-            buf = BytesIO()
             self.conn.retrbinary(f"RETR {remote_file}", buf.write)
-        except error_perm as error_message:
-            self.logger.fail(f"Failed to get file content. Response: ({error_message})")
-            return False
-        except FileNotFoundError:
-            self.logger.fail("Failed to get file content. Response: (No such file or directory.)")
-            return False
-
-        try:
-            for line in buf.getvalue().decode().splitlines():
-                self.logger.highlight(line)
-        except UnicodeDecodeError as e:
-            self.logger.fail(f"File is not in UTF-8: {e}")
+        except (error_perm, error_temp, OSError) as e:
+            error = str(e)
+            self.logger.fail(f"Failed to get file content: {e}")
+        if error is None:
+            try:
+                for line in buf.getvalue().decode().splitlines():
+                    self.logger.highlight(line)
+            except UnicodeDecodeError as e:
+                self.logger.display(f"Binary content cannot be displayed as UTF-8: {e}")
+        if self.playbook_mode:
+            return ActionResult("ftp", "cat", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, FTPContentData(remote_file, buf.getvalue()), error=error)
+        return False if error else None
 
     def supported_commands(self):
         raw_supported_commands = self.conn.sendcmd("HELP")

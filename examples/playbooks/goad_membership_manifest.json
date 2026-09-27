@@ -1,0 +1,364 @@
+{
+  "source": "ad/GOAD/data/config.json",
+  "source_sha256": "af8ac0390eab55476ae3dcd5264b698c9f4e1e74b9ac8dea26e2da2f2e88b442",
+  "domains": {
+    "sevenkingdoms.local": {
+      "dc": "10.60.0.10",
+      "memberships": [
+        {
+          "group": "Lannister",
+          "member": "tywin.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Lannister",
+          "member": "jaime.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Lannister",
+          "member": "cersei.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Baratheon",
+          "member": "cersei.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Domain Admins",
+          "member": "cersei.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "cersei.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Lannister",
+          "member": "tyron.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Baratheon",
+          "member": "robert.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Domain Admins",
+          "member": "robert.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "robert.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Protected Users",
+          "member": "robert.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Baratheon",
+          "member": "joffrey.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Lannister",
+          "member": "joffrey.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Baratheon",
+          "member": "renly.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "renly.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Baratheon",
+          "member": "stannis.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "stannis.baratheon",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "petyer.baelish",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "lord.varys",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Small Council",
+          "member": "maester.pycelle",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "AcrossTheNarrowSea",
+          "member": "daenerys.targaryen",
+          "member_domain": "essos.local",
+          "source_kind": "cross_domain"
+        }
+      ]
+    },
+    "north.sevenkingdoms.local": {
+      "dc": "10.60.0.11",
+      "memberships": [
+        {
+          "group": "Stark",
+          "member": "arya.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "eddard.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Domain Admins",
+          "member": "eddard.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "catelyn.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "robb.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "sansa.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "brandon.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "rickon.stark",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "hodor",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Stark",
+          "member": "jon.snow",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Night Watch",
+          "member": "jon.snow",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Night Watch",
+          "member": "samwell.tarly",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Night Watch",
+          "member": "jeor.mormont",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Mormont",
+          "member": "jeor.mormont",
+          "member_domain": "north.sevenkingdoms.local",
+          "source_kind": "user"
+        }
+      ]
+    },
+    "essos.local": {
+      "dc": "10.60.0.12",
+      "memberships": [
+        {
+          "group": "Targaryen",
+          "member": "daenerys.targaryen",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Domain Admins",
+          "member": "daenerys.targaryen",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Targaryen",
+          "member": "viserys.targaryen",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Dothraki",
+          "member": "khal.drogo",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Targaryen",
+          "member": "jorah.mormont",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "Dragons",
+          "member": "drogon",
+          "member_domain": "essos.local",
+          "source_kind": "user"
+        },
+        {
+          "group": "QueenProtector",
+          "member": "Dragons",
+          "member_domain": "essos.local",
+          "source_kind": "nested_group"
+        },
+        {
+          "group": "Domain Admins",
+          "member": "QueenProtector",
+          "member_domain": "essos.local",
+          "source_kind": "nested_group"
+        },
+        {
+          "group": "DragonsFriends",
+          "member": "tyron.lannister",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "cross_domain"
+        },
+        {
+          "group": "DragonsFriends",
+          "member": "daenerys.targaryen",
+          "member_domain": "essos.local",
+          "source_kind": "cross_domain"
+        },
+        {
+          "group": "Spys",
+          "member": "Small Council",
+          "member_domain": "sevenkingdoms.local",
+          "source_kind": "cross_domain"
+        }
+      ]
+    }
+  },
+  "hosts": {
+    "10.60.0.10": {
+      "name": "kingslanding",
+      "domain": "sevenkingdoms.local",
+      "local_groups": {
+        "Administrators": [
+          "sevenkingdoms\\robert.baratheon",
+          "sevenkingdoms\\cersei.lannister",
+          "sevenkingdoms\\DragonRider"
+        ],
+        "Remote Desktop Users": [
+          "sevenkingdoms\\Small Council",
+          "sevenkingdoms\\Baratheon"
+        ]
+      }
+    },
+    "10.60.0.11": {
+      "name": "winterfell",
+      "domain": "north.sevenkingdoms.local",
+      "local_groups": {
+        "Administrators": [
+          "north\\eddard.stark",
+          "north\\catelyn.stark",
+          "north\\robb.stark"
+        ],
+        "Remote Desktop Users": [
+          "north\\Stark"
+        ]
+      }
+    },
+    "10.60.0.12": {
+      "name": "meereen",
+      "domain": "essos.local",
+      "local_groups": {
+        "Administrators": [
+          "essos\\daenerys.targaryen",
+          "essos\\greatmaster"
+        ],
+        "Remote Desktop Users": [
+          "essos\\Targaryen"
+        ]
+      }
+    },
+    "10.60.0.22": {
+      "name": "castelblack",
+      "domain": "north.sevenkingdoms.local",
+      "local_groups": {
+        "Administrators": [
+          "north\\jeor.mormont"
+        ],
+        "Remote Desktop Users": [
+          "north\\Night Watch",
+          "north\\Mormont",
+          "north\\Stark"
+        ]
+      }
+    },
+    "10.60.0.23": {
+      "name": "braavos",
+      "domain": "essos.local",
+      "local_groups": {
+        "Administrators": [
+          "essos\\khal.drogo"
+        ]
+      }
+    }
+  }
+}

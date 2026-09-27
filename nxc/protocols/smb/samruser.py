@@ -1,5 +1,6 @@
 # Stolen from Impacket
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from impacket.dcerpc.v5 import samr
@@ -9,24 +10,37 @@ from impacket.nt_errors import STATUS_MORE_ENTRIES
 from nxc.helpers.rpc import NXCRPCConnection
 
 
+@dataclass
+class SamrUser:
+    username: str
+    password_last_set: str
+    bad_password_count: int
+    description: str
+
+
 class UserSamrDump:
     def __init__(self, connection):
         self.logger = connection.logger
         self.connection = connection
         self.users = []
+        self.user_records = []
         self.dce = None
+        self.error = None
+        self.exported = False
 
     def dump(self, requested_users=None, dump_path=None):
         try:
             self.dce = NXCRPCConnection(self.connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
         except Exception as e:
             self.logger.debug(f"Failed to connect to SAMR: {e}")
+            self.error = str(e) or type(e).__name__
             return self.users
 
         try:
             self.fetch_users(requested_users, dump_path)
         except Exception as e:
             self.logger.debug(f"Connection failed: {e}")
+            self.error = str(e) or type(e).__name__
         return self.users
 
     def fetch_users(self, requested_users, dump_path):
@@ -75,8 +89,10 @@ class UserSamrDump:
                 rids = [r["Data"] for r in names_lookup_resp["RelativeIds"]["Element"]]
                 self.logger.debug(f"Specific RIDs retrieved: {rids}")
                 users = self.get_user_info(domain_handle, rids)
+                self.users.extend(users)
             except DCERPCException as e:
                 self.logger.debug(f"Exception while requesting users in domain: {e}")
+                self.error = str(e) or type(e).__name__
                 if "STATUS_SOME_NOT_MAPPED" in str(e):
                     # which user is not translated correctly isn't returned so we can't tell the user which is failing, which is very annoying
                     self.logger.fail("One of the users requested does not exist in the domain, causing a critical failure during translation, re-check the users and try again")
@@ -91,22 +107,25 @@ class UserSamrDump:
                 except DCERPCException as e:
                     if str(e).find("STATUS_MORE_ENTRIES") < 0:
                         self.logger.fail("Error enumerating domain user(s)")
+                        self.error = str(e) or type(e).__name__
                         break
                     enumerate_users_resp = e.get_packet()
 
                 rids = [r["RelativeId"] for r in enumerate_users_resp["Buffer"]["Buffer"]]
                 self.logger.debug(f"Full domain RIDs retrieved: {rids}")
                 users = self.get_user_info(domain_handle, rids)
+                self.users.extend(users)
 
                 # set these for the while loop
                 enumerationContext = enumerate_users_resp["EnumerationContext"]
                 status = enumerate_users_resp["ErrorCode"]
 
-        self.logger.display(f"Enumerated {len(users)} local users: {domain_name}")
+        self.logger.display(f"Enumerated {len(self.users)} local users: {domain_name}")
         if dump_path:
-            self.logger.display(f"Writing {len(users)} local users to {dump_path}")
+            self.logger.display(f"Writing {len(self.users)} local users to {dump_path}")
             with open(dump_path, "w+") as file:
-                file.writelines(f"{user}\n" for user in users)
+                file.writelines(f"{user}\n" for user in self.users)
+            self.exported = True
         self.dce.disconnect()
 
     def get_user_info(self, domain_handle, user_ids):
@@ -136,6 +155,7 @@ class UserSamrDump:
             if last_pw_set == "1601-01-01 00:00:00":
                 last_pw_set = "<never>"
             users.append(user_name)
+            self.user_records.append(SamrUser(str(user_name), last_pw_set, int(bad_pwd_count), str(user_description)))
             self.logger.highlight(f"{user_name:<30}{last_pw_set:<20}{bad_pwd_count:<8}{user_description} ")
             samr.hSamrCloseHandle(self.dce, open_user_resp["UserHandle"])
         return users

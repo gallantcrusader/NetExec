@@ -6,8 +6,10 @@ from impacket.dcerpc.v5.rpch import RPC_PROXY_INVALID_RPC_PORT_ERR, \
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE
 from impacket import uuid
 import requests
+from dataclasses import dataclass
 from nxc.helpers.misc import CATEGORY
 from nxc.helpers.rpc import NXCRPCConnection
+from nxc.playbooks.results import ActionResult, ResultStatus
 import contextlib
 
 
@@ -28,6 +30,14 @@ class NXCModule:
     description = "Anonymously uses RPC endpoints to hunt for ADCS CAs"
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
+
+    @dataclass
+    class ResultData:
+        adcs_found: bool
+        web_enrollment_found: bool
+        enrollment_url: str | None
+
+    result_type = ResultData
 
     def __init__(self, context=None, module_options=None):
         self.context = context
@@ -92,7 +102,7 @@ class NXCModule:
                RPC_PROXY_CONN_A1_0X6BA_ERR in error_text:
                 context.log.fail("This usually means the target does not allow "
                                  "to connect to its epmapper using RpcProxy.")
-            return
+            return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, self.ResultData(False, False, None), error=error_text)
         finally:
             with contextlib.suppress(Exception):
                 dce.disconnect()
@@ -107,13 +117,16 @@ class NXCModule:
                     context.log.highlight("Active Directory Certificate Services Found.")
                     url = f"http://{connection.host}/certsrv/certfnsh.asp"
                     context.log.highlight(url)
+                    web_enrollment_found = False
                     try:
                         response = requests.get(url, timeout=5)
                         if response.status_code == 401 and "WWW-Authenticate" in response.headers and "ntlm" in response.headers["WWW-Authenticate"].lower():
                             context.log.highlight("Web enrollment found on HTTP (ESC8).")
+                            web_enrollment_found = True
                     except requests.RequestException as e:
                         context.log.debug(e)
-                    return
+                    return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.SUCCESS, self.ResultData(True, web_enrollment_found, url))
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.NEGATIVE, self.ResultData(False, False, None))
 
     def __fetchList(self, doKerberos, rpctransport):
         dce = rpctransport.get_dce_rpc()

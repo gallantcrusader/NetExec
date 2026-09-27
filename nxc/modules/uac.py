@@ -1,7 +1,9 @@
 
-from impacket.dcerpc.v5 import rrp
-from impacket.examples.secretsdump import RemoteOperations
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import read_registry_value
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -17,24 +19,25 @@ class NXCModule:
     def options(self, context, module_options):
         """ """
 
+    @dataclass
+    class ResultData:
+        present: bool
+        value: int | None
+        enabled: bool | None
+
+    result_type = ResultData
+
     def on_admin_login(self, context, connection):
-        remoteOps = RemoteOperations(connection.conn, False)
-        remoteOps.enableRegistry()
-
-        ans = rrp.hOpenLocalMachine(remoteOps._RemoteOperations__rrp)
-        regHandle = ans["phKey"]
-        ans = rrp.hBaseRegOpenKey(
-            remoteOps._RemoteOperations__rrp,
-            regHandle,
-            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        setting = read_registry_value(connection, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA")
+        enabled = setting.value in (1,) if setting.present else None
+        if setting.error:
+            context.log.fail(setting.error)
+        elif setting.present:
+            context.log.highlight(f"UAC registry value: {setting.value} (enabled: {enabled})")
+        else:
+            context.log.display("EnableLUA registry value is absent")
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if setting.error else ResultStatus.SUCCESS if enabled else ResultStatus.NEGATIVE,
+            self.ResultData(setting.present, setting.value, enabled), error=setting.error,
         )
-        keyHandle = ans["phkResult"]
-        dataType, uac_value = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, keyHandle, "EnableLUA")
-
-        if uac_value == 1:
-            context.log.highlight("UAC Status: 1 (UAC Enabled)")
-        elif uac_value == 0:
-            context.log.highlight("UAC Status: 0 (UAC Disabled)")
-
-        rrp.hBaseRegCloseKey(remoteOps._RemoteOperations__rrp, keyHandle)
-        remoteOps.finish()

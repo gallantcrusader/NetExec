@@ -1,10 +1,14 @@
 import json
+from dataclasses import dataclass, field
+from sys import exit
 import datetime
 import os
 from pathlib import Path
 import re
 from nxc.helpers.misc import CATEGORY
 from nxc.paths import NXC_PATH
+from nxc.helpers.path import sanitize_filename
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus, json_value
 
 
 class NXCModule:
@@ -14,16 +18,23 @@ class NXCModule:
     supported_protocols = ["mssql"]
     category = CATEGORY.CREDENTIAL_DUMPING
 
+    @dataclass
+    class ResultData:
+        matches: list[dict] = field(default_factory=list)
+        queries: list[dict] = field(default_factory=list)
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """
         SHOW_DATA    Display the actual row data values of the matched columns (default: True)
         REGEX        Semicolon-separated regex(es) to search for in **Cell Values**
         LIKE_SEARCH  Comma-separated list or filename of column names to specifically look for
         USE_PRESET   Use a predefined set of regex patterns for common PII (default: True)
-        SAVE         Save the output to sqlite database (default: True)
+        SAVE         Save the output to a JSON file (default: True)
         """
         self.regex_patterns = []
-        self.show_data = module_options.get("SHOW_DATA", "true").lower() in ["true", "1", "yes"]
+        self.show_data = str(module_options.get("SHOW_DATA", "true")).lower() in ["true", "1", "yes"]
         regex_input = module_options.get("REGEX", "")
         for pattern in regex_input.split(";"):
             pattern = pattern.strip()
@@ -32,14 +43,15 @@ class NXCModule:
                     self.regex_patterns.append(re.compile(pattern))
                 except re.error as e:
                     context.log.fail(f"[!] Invalid regex pattern '{pattern}': {e}")
+                    exit(1)
         like_input = module_options.get("LIKE_SEARCH", "")
         if os.path.isfile(like_input):
             with open(like_input) as f:
                 self.like_search = [line.strip().lower() for line in f if line.strip()]
         else:
             self.like_search = [s.strip().lower() for s in like_input.split(",") if s.strip()]
-        self.use_preset = module_options.get("USE_PRESET", "true").lower() in ["true", "1", "yes"]
-        self.save = module_options.get("SAVE", "true").lower() in ["true", "1", "yes"]
+        self.use_preset = str(module_options.get("USE_PRESET", "true")).lower() in ["true", "1", "yes"]
+        self.save = str(module_options.get("SAVE", "true")).lower() in ["true", "1", "yes"]
 
     def pii(self):
         """Common personally identifiable information (PII) keywords to search for in column names"""
@@ -63,85 +75,80 @@ class NXCModule:
                 "zip", "zipcode"]
 
     def on_login(self, context, connection):
-        all_results = []
-        databases = connection.conn.sql_query("SELECT name FROM master.dbo.sysdatabases")
-        if connection.conn.lastError:
-            context.log.fail(f"Failed to retrieve databases: {connection.conn.lastError}")
-            return
-
-        for db in databases:
-            db_name = db.get("name") or db.get("", "")
-            if db_name.lower() in ("master", "model", "msdb", "tempdb"):
-                continue  # skip system DBs
-
-            context.log.display(f"Searching database: {db_name}")
-            connection.conn.sql_query(f"USE [{db_name}]")
-
-            # get all tables in this DB
-            tables = connection.conn.sql_query("SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'")
-
-            for table in tables:
-                table_name = table.get("table_name", "")
-                try:
-                    columns = connection.conn.sql_query(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
-
-                    # find matching columns
-                    search_keys = []
-                    if self.use_preset:
-                        search_keys += self.pii()
-                    if self.like_search:
-                        search_keys += self.like_search
-                    matched = [col for col in columns if any(key in col["column_name"].lower() for key in search_keys)]
+        data = self.ResultData()
+        errors, artifacts = [], []
+        search_keys = (self.pii() if self.use_preset else []) + self.like_search
+        try:
+            databases = self.query(connection, data, errors, "SELECT name FROM master.dbo.sysdatabases")
+            for database in databases if not errors else []:
+                db_name = database["name"]
+                if db_name.lower() in ("master", "model", "msdb", "tempdb"):
+                    continue
+                qualified_db = self.identifier(db_name)
+                tables = self.query(connection, data, errors, f"SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM {qualified_db}.INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")
+                for table in tables if not errors else []:
+                    schema, name = table["table_schema"], table["table_name"]
+                    qualified_table = f"{qualified_db}.{self.identifier(schema)}.{self.identifier(name)}"
+                    columns = self.query(connection, data, errors, f"SELECT COLUMN_NAME AS column_name FROM {qualified_db}.INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = {self.literal(schema)} AND TABLE_NAME = {self.literal(name)} ORDER BY ORDINAL_POSITION")
+                    if errors:
+                        break
+                    matched = [column["column_name"] for column in columns if any(key in column["column_name"].lower() for key in search_keys)]
                     if matched:
-                        column_str = ", ".join(f"[{c['column_name']}]" for c in matched)
-                        context.log.success(f"Match in {db_name}.{table_name} => Columns: {column_str}")
-                        data = connection.conn.sql_query(f"SELECT {column_str} FROM [{table_name}]")
-                        for row in data:
-                            decoded_data = {k: (v.decode("utf-8", "replace").strip() if isinstance(v, bytes) else str(v).strip()) for k, v in row.items()}
+                        rows = self.query(connection, data, errors, f"SELECT {', '.join(self.identifier(column) for column in matched)} FROM {qualified_table}")
+                        for row in rows:
+                            data.matches.append({"type": "column_match", "database": db_name, "schema": schema, "table": name, "row": row})
                             if self.show_data:
-                                context.log.highlight(f"{db_name}.{table_name} => " + ", ".join(f"{k}: {v}" for k, v in decoded_data.items()))
-                            all_results.append({
-                                "type": "column_match",
-                                "database": db_name,
-                                "table": table_name,
-                                "row": {k: v.strip() for k, v in decoded_data.items()}
-                            })
-
-                except Exception as e:
-                    context.log.fail(f"Failed to inspect table {table_name} in {db_name}: {e}")
-
-                # If regex patterns are provided, scan all cell values in the table for matches
-                if self.regex_patterns:
-                    try:
-                        full_data = connection.conn.sql_query(f"SELECT * FROM [{table_name}]")
-                        for row in full_data:
+                                context.log.highlight(f"{qualified_table}: {row}")
+                    if errors:
+                        break
+                    if self.regex_patterns:
+                        rows = self.query(connection, data, errors, f"SELECT * FROM {qualified_table}")
+                        for row in rows:
                             matched_cells = {}
-                            for col, val in row.items():
-                                val_str = val.decode("utf-8", "replace").strip() if isinstance(val, bytes) else str(val).strip()
-
-                                # Check if any of the cells in the row match any of the regex patterns
-                                for pattern in self.regex_patterns:
-                                    if pattern.search(val_str):
-                                        matched_cells[col] = val_str
-                                        break
-
+                            for column, value in row.items():
+                                text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+                                if any(pattern.search(text) for pattern in self.regex_patterns):
+                                    matched_cells[column] = value
                             if matched_cells:
-                                match_str = ", ".join(f"{k}: {v}" for k, v in matched_cells.items())
+                                data.matches.append({"type": "regex_match", "database": db_name, "schema": schema, "table": name, "matched_cells": matched_cells})
                                 if self.show_data:
-                                    context.log.highlight(f"{db_name}.{table_name} => Regex Match => {match_str}")
-                                all_results.append({
-                                    "type": "regex_match",
-                                    "database": db_name,
-                                    "table": table_name,
-                                    "matched_cells": matched_cells
-                                })
-                    except Exception as e:
-                        context.log.fail(f"Regex scan failed for {db_name}.{table_name}: {e}")
+                                    context.log.highlight(f"{qualified_table}: {matched_cells}")
+                    if errors:
+                        break
+                if errors:
+                    break
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        if self.save and data.matches:
+            path = Path(NXC_PATH) / "modules" / "mssql-dumper" / f"{sanitize_filename(connection.host)}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(json_value(data.matches), indent=2), encoding="utf-8")
+                artifacts.append(Artifact(path, "sql_matches"))
+                context.log.success(f"Data saved to {path}")
+            except Exception as e:
+                errors.append(f"Saving SQL matches: {str(e) or type(e).__name__}")
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult("mssql", self.name, connection.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if data.matches else ResultStatus.NEGATIVE, data, artifacts=artifacts, error="; ".join(errors) or None)
 
-        if self.save and all_results:
-            filename = f"{connection.hostname}_{connection.host}_{datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')}.json"
-            file_path = Path(f"{NXC_PATH}/modules/mssql-dumper/{filename}").resolve()
-            os.makedirs(file_path.parent, exist_ok=True)
-            with open(file_path, "w") as f:
-                json.dump(all_results, f, indent=2)
-                context.log.success(f"Data saved to {file_path}")
+    def query(self, connection, data, errors, sql):
+        step = {"query": sql, "row_count": 0, "error": None}
+        data.queries.append(step)
+        rows = []
+        try:
+            rows = connection.conn.sql_query(sql) or []
+            step["row_count"] = len(rows)
+            if connection.conn.lastError:
+                step["error"] = str(connection.conn.lastError)
+        except Exception as e:
+            step["error"] = str(e) or type(e).__name__
+        if step["error"]:
+            errors.append(step["error"])
+        return rows
+
+    def identifier(self, value):
+        return "[" + value.replace("]", "]]") + "]"
+
+    def literal(self, value):
+        return "'" + value.replace("'", "''") + "'"

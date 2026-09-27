@@ -1,9 +1,8 @@
+from dataclasses import dataclass
+from nxc.playbooks.results import ActionResult, ResultStatus
 from impacket.dcerpc.v5 import rrp
-from impacket.dcerpc.v5.rpcrt import DCERPCException
-from impacket.smbconnection import SessionError
 from nxc.helpers.misc import CATEGORY
 from nxc.helpers.rpc import NXCRPCConnection
-from impacket.nmb import NetBIOSError
 
 
 class NXCModule:
@@ -16,8 +15,15 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        os_version: tuple
+        ubr: int | None
+        checks: list[dict]
+
+    result_type = ResultData
+
     def __init__(self, context=None, module_options=None):
-        context = context
         self.module_options = module_options
         self.cve = "all"
         self.exploitation_details = False
@@ -44,7 +50,7 @@ class NXCModule:
         if "CVE" in module_options:
             self.cve = module_options["CVE"].lower()
         if "EXPLOITATION" in module_options:
-            self.exploitation_details = module_options["EXPLOITATION"].lower() in ["true", "1", "yes"]
+            self.exploitation_details = str(module_options["EXPLOITATION"]).lower() in ["true", "1", "yes"]
 
     def is_vulnerable(self, major, minor, build, ubr, msrc):
         key = (major, minor, build)
@@ -56,49 +62,65 @@ class NXCModule:
         return ubr < min_patched_ubr
 
     def on_login(self, context, connection):
-        connection.trigger_winreg()
-
+        version = (connection.server_os_major, connection.server_os_minor, connection.server_os_build)
+        checks, errors, handles = [], [], []
+        dce, ubr = None, None
+        selected = {cve: details for cve, details in self.CVE_PATCHES.items() if self.cve == "all" or self.cve.lower() == cve.lower()}
         try:
-            # Connect to RemoteRegistry to read UBR from registry
+            if not selected:
+                raise ValueError(f"No patch comparison available for {self.cve}")
+            connection.trigger_winreg()
             dce = NXCRPCConnection(connection).connect(r"\winreg", rrp.MSRPC_UUID_RRP)
-            # Reading UBR from registry
-            hRootKey = rrp.hOpenLocalMachine(dce)["phKey"]
-            hKey = rrp.hBaseRegOpenKey(dce, hRootKey, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")["phkResult"]
-            ubr = rrp.hBaseRegQueryValue(dce, hKey, "UBR")[1]
-            dce.disconnect()
-            if not ubr:
-                context.log.info("Could not determine OS version from registry")
-                return
-            else:
-                context.log.debug(f"OS version from registry: {connection.server_os_major}.{connection.server_os_minor}.{connection.server_os_build}.{ubr}")
-        except DCERPCException as e:
-            context.log.fail(f"DCERPC error: {e}")
-            return
-        except SessionError as e:
-            if "STATUS_OBJECT_NAME_NOT_FOUND" in str(e):
-                context.log.info(f"RemoteRegistry is probably deactivated: {e}")
-            else:
-                context.log.fail(f"Unexpected error: {e}")
-            return
-        except (BrokenPipeError, ConnectionResetError, NetBIOSError, OSError) as e:
-            context.log.fail(f"DCERPC transport error: {e.__class__.__name__}: {e}")
-            return
-
-        # Check each CVE
-        for cve in self.CVE_PATCHES:
-            if self.cve == "all" or self.cve.lower() == cve.lower():
-                if self.CVE_PATCHES[cve].get("dc_only") and not connection.is_host_dc():
-                    context.log.info(f"Skipping {self.CVE_PATCHES[cve]['alias']} - only applicable to Domain Controllers")
-                    continue
-                if self.is_vulnerable(connection.server_os_major, connection.server_os_minor, connection.server_os_build, ubr, self.CVE_PATCHES[cve]["patches"]):
-                    if connection.conn.isSigningRequired() and "signing_message" in self.CVE_PATCHES[cve]:  # Special conditional message for some CVEs
-                        context.log.highlight(f"{cve.upper()} - {self.CVE_PATCHES[cve]['alias']} - {self.CVE_PATCHES[cve]['signing_message']}")
-                    else:
-                        context.log.highlight(f"{cve.upper()} - {self.CVE_PATCHES[cve]['alias']} - {self.CVE_PATCHES[cve]['message']}")
-                    if self.exploitation_details:
-                        context.log.highlight(f"Exploitation details: {self.CVE_PATCHES[cve]['exploitation']}")
+            root = rrp.hOpenLocalMachine(dce)["phKey"]
+            handles.append(root)
+            key = rrp.hBaseRegOpenKey(dce, root, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")["phkResult"]
+            handles.append(key)
+            registry_type, observed = rrp.hBaseRegQueryValue(dce, key, "UBR")
+            if registry_type != rrp.REG_DWORD or not isinstance(observed, int):
+                raise ValueError("UBR is not a DWORD revision")
+            ubr = observed
+            dc = connection.is_host_dc() if any(item.get("dc_only") for item in selected.values()) else None
+            for cve, details in selected.items():
+                threshold = details["patches"].get(version)
+                row = {"cve": cve, "alias": details["alias"], "minimum_patched_ubr": threshold,
+                       "below_patch_threshold": None, "status": "unknown", "reason": None,
+                       "dc_only": bool(details.get("dc_only")), "is_dc": dc, "signing_required": None}
+                checks.append(row)
+                if details.get("dc_only") and dc is False:
+                    row.update(status="skipped", reason="Only applicable to Domain Controllers")
+                elif details.get("dc_only") and dc is None:
+                    row["reason"] = "Domain Controller role could not be determined"
+                    errors.append(f"{cve}: {row['reason']}")
+                elif threshold is None:
+                    row["reason"] = f"No patch threshold for OS build {version}"
+                    errors.append(f"{cve}: {row['reason']}")
                 else:
-                    context.log.info(f"Not vulnerable to {self.CVE_PATCHES[cve]['alias']} (UBR {ubr} >= {self.CVE_PATCHES[cve]['patches'].get((connection.server_os_major, connection.server_os_minor, connection.server_os_build), 'unknown')})")
+                    row["below_patch_threshold"] = ubr < threshold
+                    row["status"] = "below_threshold" if ubr < threshold else "at_or_above_threshold"
+                    if ubr < threshold and "signing_message" in details:
+                        row["signing_required"] = connection.conn.isSigningRequired()
+                    context.log.highlight(f"{cve} - {details['alias']}: UBR {ubr}, patch threshold {threshold} ({row['status']})")
+                    if self.exploitation_details:
+                        context.log.highlight(f"Exploitation details: {details['exploitation']}")
+                if row["reason"]:
+                    context.log.info(f"{cve}: {row['reason']}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        finally:
+            for handle in reversed(handles):
+                try:
+                    rrp.hBaseRegCloseKey(dce, handle)
+                except Exception as e:
+                    errors.append(f"Closing registry handle: {e}")
+            if dce is not None:
+                try:
+                    dce.disconnect()
+                except Exception as e:
+                    errors.append(f"Disconnecting registry RPC: {e}")
+        for error in errors:
+            context.log.fail(error)
+        status = ResultStatus.FAILED if errors else ResultStatus.SUCCESS if any(row["below_patch_threshold"] for row in checks) else ResultStatus.SKIPPED if all(row["status"] == "skipped" for row in checks) else ResultStatus.NEGATIVE
+        return ActionResult("smb", self.name, connection.host, status, self.ResultData(version, ubr, checks), error="; ".join(errors) or None)
 
     # patches: key = (major, minor, build), value = minimum patched UBR
     CVE_PATCHES = {

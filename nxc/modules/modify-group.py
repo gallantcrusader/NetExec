@@ -1,5 +1,8 @@
-import contextlib
-import sys
+from dataclasses import dataclass
+from sys import exit
+
+from ldap3.utils.conv import escape_filter_chars
+from nxc.playbooks.results import ActionResult, ResultStatus
 from impacket.ldap.ldap import MODIFY_ADD, MODIFY_DELETE
 from impacket.dcerpc.v5 import samr
 from nxc.helpers.rpc import NXCRPCConnection
@@ -18,9 +21,22 @@ class NXCModule:
     supported_protocols = ["smb", "ldap"]
     category = CATEGORY.PRIVILEGE_ESCALATION
 
+    @dataclass
+    class ResultData:
+        user: str
+        group: str
+        remove: bool
+        completed: bool = False
+        user_dn: str | None = None
+        group_dn: str | None = None
+        user_rid: int | None = None
+        group_rid: int | None = None
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """
-        Required (at least one of):
+        Required:
         GROUP       Name of the group to add/remove the user to/from
         USER        Username of the account to modify
 
@@ -50,119 +66,86 @@ class NXCModule:
 
         if not (self.target_user and self.group):
             context.log.fail("USER and GROUP parameters are required!")
-            sys.exit(1)
+            exit(1)
 
     def on_login(self, context, connection):
         self.context = context
         self.connection = connection
-
+        self.data = self.ResultData(self.target_user, self.group, self.remove)
+        self.errors = []
         if context.protocol == "smb":
-            self._modify_group_smb()
-        elif context.protocol == "ldap" and self.group:
-            self._modify_group_ldap()
-
-    def _modify_group_smb(self):
-        """Modify group membership using SMB/SAMR protocol"""
-        dce = NXCRPCConnection(self.connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
-        if not dce:
-            return
-
-        # Get domain handle
-        try:
-            server_handle = samr.hSamrConnect(dce, self.connection.host + "\x00")["ServerHandle"]
-            domain_sid = samr.hSamrLookupDomainInSamServer(dce, server_handle, self.connection.domain)["DomainId"]
-            domain_handle = samr.hSamrOpenDomain(dce, server_handle, domainId=domain_sid)["DomainHandle"]
-        except Exception as e:
-            self.context.log.fail(f"Failed to connect to SAMR service: {e}")
-            return
-
-        # Find the user RID
-        try:
-            user_rid = samr.hSamrLookupNamesInDomain(dce, domain_handle, (self.target_user,))["RelativeIds"]["Element"][0]
-        except Exception as e:
-            if "STATUS_NONE_MAPPED" in str(e):
-                self.context.log.fail(f"Target user not found: {self.target_user}")
-            else:
-                self.context.log.fail(f"Failed to find user RID: {e}")
-            return
-
-        # Find the group RID and open the group
-        try:
-            group_rid = samr.hSamrLookupNamesInDomain(dce, domain_handle, (self.group,))["RelativeIds"]["Element"][0]
-            group_handle = samr.hSamrOpenGroup(dce, domain_handle, groupId=group_rid)["GroupHandle"]
-        except Exception as e:
-            if "STATUS_NONE_MAPPED" in str(e):
-                self.context.log.fail(f"Target group not found: {self.group}")
-            else:
-                self.context.log.fail(f"Failed to find group: {e}")
-            return
-
-        # Modify group membership
-        if self.remove:
-            try:
-                samr.hSamrRemoveMemberFromGroup(dce, group_handle, user_rid)
-                self.context.log.success(f"Successfully removed {self.target_user} from group {self.group}")
-            except Exception as e:
-                if "STATUS_MEMBER_NOT_IN_GROUP" in str(e):
-                    self.context.log.fail(f"User {self.target_user} is not a member of group {self.group}")
-                else:
-                    self.context.log.fail(f"Failed to remove user from group via SMB: {e}")
+            self.modify_group_smb()
         else:
-            try:
-                samr.hSamrAddMemberToGroup(dce, group_handle, user_rid, 0x7)
-                self.context.log.success(f"Successfully added {self.target_user} to group {self.group}")
-            except Exception as e:
-                if "STATUS_MEMBER_IN_GROUP" in str(e):
-                    self.context.log.fail(f"User {self.target_user} is already a member of group {self.group}")
-                else:
-                    self.context.log.fail(f"Failed to add user to group via SMB: {e}")
-
-        # Disconnect from DCE/RPC
-        with contextlib.suppress(Exception):
-            dce.disconnect()
-
-    def _modify_group_ldap(self):
-        """Modify group membership using LDAP protocol"""
-        # Get the DN of the target user
-        resp = self._find_object_dn(self.target_user)
-        if not resp:
-            self.context.log.fail(f"Target user not found: {self.target_user}")
-            return
-        else:
-            target_user_dn = resp[0]["distinguishedName"]
-
-        # Get the DN of the target group
-        resp = self._find_object_dn(self.group)
-        if not resp:
-            self.context.log.fail(f"Target group not found: {self.group}")
-            return
-        else:
-            group_dn = resp[0]["distinguishedName"]
-
-        # Modify group membership
-        if self.remove:
-            try:
-                self.connection.ldap_connection.modify(group_dn, {"member": [(MODIFY_DELETE, [target_user_dn])]})
-                self.context.log.success(f"Successfully removed {self.target_user} from group {self.group}")
-            except Exception as e:
-                if "unwillingToPerform" in str(e):
-                    self.context.log.fail(f"User {self.target_user} is not a member of group {self.group}")
-                else:
-                    self.context.log.fail(f"Failed to remove user from group via LDAP: {e}")
-        else:
-            try:
-                self.connection.ldap_connection.modify(group_dn, {"member": [(MODIFY_ADD, [target_user_dn])]})
-                self.context.log.success(f"Successfully added {self.target_user} to group {self.group}")
-            except Exception as e:
-                if "entryAlreadyExists" in str(e):
-                    self.context.log.fail(f"User {self.target_user} is already a member of group {self.group}")
-                else:
-                    self.context.log.fail(f"Failed to add user to group via LDAP: {e}")
-
-    def _find_object_dn(self, value):
-        """Find the distinguished name (DN) of an object by sAMAccountName"""
-        resp = self.connection.ldap_connection.search(
-            searchFilter=f"(sAMAccountName={value})",
-            attributes=["distinguishedName"]
+            self.modify_group_ldap()
+        for error in self.errors:
+            context.log.fail(error)
+        if self.data.completed:
+            context.log.success(f"Membership {'removal' if self.remove else 'addition'} acknowledged for {self.target_user} in {self.group}")
+        return ActionResult(
+            context.protocol, self.name, connection.host,
+            ResultStatus.FAILED if self.errors or not self.data.completed else ResultStatus.SUCCESS,
+            self.data, error="; ".join(self.errors) or None,
         )
-        return parse_result_attributes(resp)
+
+    def modify_group_smb(self):
+        dce = None
+        handles = []
+        try:
+            dce = NXCRPCConnection(self.connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
+            server = samr.hSamrConnect(dce, self.connection.host + "\x00")["ServerHandle"]
+            handles.append(server)
+            sid = samr.hSamrLookupDomainInSamServer(dce, server, self.connection.domain)["DomainId"]
+            domain = samr.hSamrOpenDomain(dce, server, domainId=sid)["DomainHandle"]
+            handles.append(domain)
+            user_rid = samr.hSamrLookupNamesInDomain(dce, domain, (self.target_user,))["RelativeIds"]["Element"][0]
+            group_rid = samr.hSamrLookupNamesInDomain(dce, domain, (self.group,))["RelativeIds"]["Element"][0]
+            user_rid = int(user_rid if isinstance(user_rid, int) else user_rid["Data"])
+            group_rid = int(group_rid if isinstance(group_rid, int) else group_rid["Data"])
+            self.data.user_rid = user_rid
+            self.data.group_rid = group_rid
+            group = samr.hSamrOpenGroup(dce, domain, groupId=group_rid)["GroupHandle"]
+            handles.append(group)
+            if self.remove:
+                samr.hSamrRemoveMemberFromGroup(dce, group, user_rid)
+            else:
+                samr.hSamrAddMemberToGroup(dce, group, user_rid, 0x7)
+            self.data.completed = True
+        except Exception as e:
+            self.errors.append(str(e) or type(e).__name__)
+        finally:
+            for handle in reversed(handles):
+                try:
+                    samr.hSamrCloseHandle(dce, handle)
+                except Exception as e:
+                    self.errors.append(f"Closing SAMR handle: {e}")
+            if dce is not None:
+                try:
+                    dce.disconnect()
+                except Exception as e:
+                    self.errors.append(f"Closing SAMR connection: {e}")
+
+    def find_object_dn(self, value):
+        response = self.connection.search(searchFilter=f"(sAMAccountName={escape_filter_chars(value)})", attributes=["distinguishedName"])
+        if self.connection.last_search_error:
+            self.errors.append(self.connection.last_search_error)
+            return None
+        records = parse_result_attributes(response)
+        if len(records) != 1 or not records[0].get("distinguishedName"):
+            self.errors.append(f"Expected one directory object for {value}; found {len(records)}")
+            return None
+        return records[0]["distinguishedName"]
+
+    def modify_group_ldap(self):
+        self.data.user_dn = self.find_object_dn(self.target_user)
+        if self.data.user_dn is None:
+            return
+        self.data.group_dn = self.find_object_dn(self.group)
+        if self.data.group_dn is None:
+            return
+        try:
+            acknowledged = self.connection.ldap_connection.modify(self.data.group_dn, {"member": [(MODIFY_DELETE if self.remove else MODIFY_ADD, [self.data.user_dn])]})
+            self.data.completed = acknowledged is True
+            if not self.data.completed:
+                self.errors.append("LDAP membership change was not acknowledged")
+        except Exception as e:
+            self.errors.append(str(e) or type(e).__name__)

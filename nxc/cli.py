@@ -14,7 +14,7 @@ from nxc.logger import nxc_logger, setup_debug_logging
 import importlib.metadata
 
 
-def gen_cli_args():
+def gen_cli_args(argv=None, *, with_parser=False):
     setup_debug_logging()
 
     try:
@@ -85,7 +85,7 @@ def gen_cli_args():
     subparsers = parser.add_subparsers(title="Available Protocols", dest="protocol")
 
     std_parser = argparse.ArgumentParser(add_help=False, parents=[generic_parser, output_parser, dns_parser], formatter_class=DisplayDefaultsNotNone)
-    std_parser.add_argument("target", nargs="+" if not (module_parser.parse_known_args()[0].list_modules is not None or module_parser.parse_known_args()[0].show_module_options or generic_parser.parse_known_args()[0].version) else "*", type=str, help="the target IP(s), range(s), CIDR(s), hostname(s), FQDN(s), file(s) containing a list of targets, NMap XML or .Nessus file(s)")
+    std_parser.add_argument("target", nargs="+" if not (module_parser.parse_known_args(argv)[0].list_modules is not None or module_parser.parse_known_args(argv)[0].show_module_options or generic_parser.parse_known_args(argv)[0].version) else "*", type=str, help="the target IP(s), range(s), CIDR(s), hostname(s), FQDN(s), file(s) containing a list of targets, NMap XML or .Nessus file(s)")
     credential_group = std_parser.add_argument_group("Authentication")
     credential_group.add_argument("-u", "--username", metavar="USERNAME", dest="username", nargs="+", default=[], help="username(s) or file(s) containing usernames")
     credential_group.add_argument("-p", "--password", metavar="PASSWORD", dest="password", nargs="+", default=[], help="password(s) or file(s) containing passwords")
@@ -120,10 +120,11 @@ def gen_cli_args():
     except Exception as e:
         nxc_logger.exception(f"Error loading proto_args from proto_args.py file in protocol folder: {protocol} - {e}")
 
-    argcomplete.autocomplete(parser, always_complete_options=False)
-    args = parser.parse_args()
+    if argv is None:
+        argcomplete.autocomplete(parser, always_complete_options=False)
+    args = parser.parse_args(argv)
 
-    if len(sys.argv) == 1:
+    if not (sys.argv[1:] if argv is None else argv):
         parser.print_help()
         sys.exit(1)
 
@@ -135,6 +136,8 @@ def gen_cli_args():
     if hasattr(args, "get_output_tries"):
         args.get_output_tries = args.get_output_tries * 10
 
+    if with_parser:
+        return args, [CODENAME, VERSION, COMMIT, DISTANCE], subparsers.choices[args.protocol]
     return args, [CODENAME, VERSION, COMMIT, DISTANCE]
 
 

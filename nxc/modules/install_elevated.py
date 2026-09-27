@@ -1,7 +1,8 @@
-from impacket.dcerpc.v5 import rrp
-from impacket.dcerpc.v5 import scmr
-from impacket.examples.secretsdump import RemoteOperations
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import RegistryValue, read_registry_value
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -10,62 +11,42 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        machine: RegistryValue
+        current_user: RegistryValue | None
+        enabled: bool | None
+
+    result_type = ResultData
+
     def options(self, context, module_options):
-        """ """
+        """No options available."""
 
     def on_admin_login(self, context, connection):
-        try:
-            remote_ops = RemoteOperations(connection.conn, False)
-            remote_ops.enableRegistry()
-
-            try:
-                ans_machine = rrp.hOpenLocalMachine(remote_ops._RemoteOperations__rrp)
-                reg_handle = ans_machine["phKey"]
-                ans_machine = rrp.hBaseRegOpenKey(
-                    remote_ops._RemoteOperations__rrp,
-                    reg_handle,
-                    "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
-                )
-                key_handle = ans_machine["phkResult"]
-                data_type, aie_machine_value = rrp.hBaseRegQueryValue(
-                    remote_ops._RemoteOperations__rrp,
-                    key_handle,
-                    "AlwaysInstallElevated",
-                )
-                rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-
-                if aie_machine_value == 0:
-                    context.log.highlight("AlwaysInstallElevated Status: 0 (Disabled)")
-                    return
-            except rrp.DCERPCSessionError:
-                context.log.highlight("AlwaysInstallElevated Status: 0 (Disabled)")
-                return
-            try:
-                ans_user = rrp.hOpenCurrentUser(remote_ops._RemoteOperations__rrp)
-                reg_handle = ans_user["phKey"]
-                ans_user = rrp.hBaseRegOpenKey(
-                    remote_ops._RemoteOperations__rrp,
-                    reg_handle,
-                    "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
-                )
-                key_handle = ans_user["phkResult"]
-                data_type, aie_user_value = rrp.hBaseRegQueryValue(
-                    remote_ops._RemoteOperations__rrp,
-                    key_handle,
-                    "AlwaysInstallElevated",
-                )
-                rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-            except rrp.DCERPCSessionError:
-                context.log.highlight("AlwaysInstallElevated Status: 1 (Enabled: Computer Only)")
-                return
-            if aie_user_value == 0:
-                context.log.highlight("AlwaysInstallElevated Status: 1 (Enabled: Computer Only)")
-            else:
-                context.log.highlight("AlwaysInstallElevated Status: 1 (Enabled)")
-        finally:
-            try:
-                remote_ops.finish()
-            except scmr.DCERPCSessionError as e:
-                context.log.debug(f"Received SessionError while attempting to clean up logins: {e}")
-            except Exception as e:
-                context.log.debug(f"Received general exception while attempting to clean up logins: {e}")
+        key = r"SOFTWARE\Policies\Microsoft\Windows\Installer"
+        machine = read_registry_value(connection, key, "AlwaysInstallElevated")
+        current_user = None
+        enabled = None
+        errors = [machine.error] if machine.error else []
+        if not machine.error:
+            enabled = False
+            if machine.present and machine.value == 1:
+                current_user = read_registry_value(connection, key, "AlwaysInstallElevated", hive="HKCU")
+                if current_user.error:
+                    errors.append(current_user.error)
+                    enabled = None
+                else:
+                    enabled = current_user.present and current_user.value == 1
+        if errors:
+            context.log.fail("; ".join(errors))
+        elif enabled:
+            context.log.highlight("AlwaysInstallElevated Status: 1 (Enabled)")
+        elif machine.present and machine.value == 1:
+            context.log.highlight("AlwaysInstallElevated Status: 1 (Enabled: Computer Only)")
+        else:
+            context.log.highlight("AlwaysInstallElevated Status: 0 (Disabled)")
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if enabled else ResultStatus.NEGATIVE,
+            self.ResultData(machine, current_user, enabled), error="; ".join(errors) if errors else None,
+        )

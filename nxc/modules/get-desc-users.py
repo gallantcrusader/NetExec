@@ -1,7 +1,7 @@
-from impacket.ldap import ldap as ldap_impacket
+from dataclasses import dataclass
 import re
 from nxc.helpers.misc import CATEGORY
-from nxc.logger import nxc_logger
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.parsers.ldap_results import parse_result_attributes
 
 
@@ -16,6 +16,12 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.CREDENTIAL_DUMPING
 
+    @dataclass
+    class ResultData:
+        users: list[dict]
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """
         FILTER    Apply the FILTER (grep-like) (default: '')
@@ -29,7 +35,7 @@ class NXCModule:
             self.FILTER = module_options["FILTER"]
         if "MINLENGTH" in module_options:
             self.MINLENGTH = module_options["MINLENGTH"]
-        if "PASSWORDPOLICY" in module_options:
+        if str(module_options.get("PASSWORDPOLICY", "false")).lower() in {"true", "1", "yes"}:
             self.PASSWORDPOLICY = True
             self.regex = re.compile(r"((?=[^ ]*[A-Z])(?=[^ ]*[a-z])(?=[^ ]*\d)|(?=[^ ]*[a-z])(?=[^ ]*\d)(?=[^ ]*[^\w \n])|(?=[^ ]*[A-Z])(?=[^ ]*\d)(?=[^ ]*[^\w \n])|(?=[^ ]*[A-Z])(?=[^ ]*[a-z])(?=[^ ]*[^\w \n]))[^ \n]{" + self.MINLENGTH + ",}$")  # Credit : https://stackoverflow.com/questions/31191248/regex-password-must-have-at-least-3-of-the-4-of-the-following
 
@@ -38,22 +44,7 @@ class NXCModule:
         # Building the search filter
         searchFilter = "(objectclass=user)"
 
-        try:
-            context.log.debug(f"Search Filter={searchFilter}")
-            resp = connection.ldap_connection.search(
-                searchFilter=searchFilter,
-                attributes=["sAMAccountName", "description"],
-                sizeLimit=0,
-            )
-        except ldap_impacket.LDAPSearchError as e:
-            if e.getErrorString().find("sizeLimitExceeded") >= 0:
-                context.log.debug("sizeLimitExceeded exception caught, giving up and processing the data received")
-                # We reached the sizeLimit, process the answers we have already and that's it. Until we implement
-                # paged queries
-                resp = e.getAnswers()
-            else:
-                nxc_logger.debug(e)
-                return False
+        resp = connection.search(searchFilter, ["sAMAccountName", "description"])
 
         context.log.debug(f"Total of records returned {len(resp)}")
         resp_parsed = parse_result_attributes(resp)
@@ -65,34 +56,20 @@ class NXCModule:
             for answer in answers:
                 context.log.highlight(f"User: {answer[0]:<20} description: {answer[1]}")
 
+        error = connection.last_search_error
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS if answers else ResultStatus.NEGATIVE,
+            self.ResultData([{"username": username, "description": description} for username, description in answers]),
+            error=error,
+        )
+
     def filter_answer(self, context, answers):
-        # No option to filter
-        if self.FILTER == "" and not self.PASSWORDPOLICY:
-            context.log.debug("No filter option enabled")
-            return answers
-        answersFiltered = []
-        context.log.debug("Prepare to filter")
-        if len(answers) > 0:
-            for answer in answers:
-                conditionFilter = False
-                description = str(answer[1])
-                # Filter
-                if self.FILTER != "":
-                    conditionFilter = False
-                    if self.FILTER in description:
-                        conditionFilter = True
-
-                # Password policy
-                if self.PASSWORDPOLICY:
-                    conditionPasswordPolicy = False
-                    if self.regex.search(description):
-                        conditionPasswordPolicy = True
-
-                if conditionFilter and not self.PASSWORDPOLICY:
-                    context.log.highlight(f"'{self.FILTER}' found in description: '{description}'")
-                elif (self.FILTER == "" and (conditionPasswordPolicy == self.PASSWORDPOLICY)):
-                    answersFiltered.append([answer[0], description])
-                elif (self.FILTER != "" and conditionFilter) and (conditionPasswordPolicy == self.PASSWORDPOLICY):
-                    context.log.highlight(f"'{self.FILTER}' found in user: '{answer[0]}' description: '{description}'")
-
-        return answersFiltered
+        filtered = []
+        for username, description in answers:
+            if self.FILTER and self.FILTER not in str(description):
+                continue
+            if self.PASSWORDPOLICY and not self.regex.search(str(description)):
+                continue
+            filtered.append([username, description])
+        return filtered

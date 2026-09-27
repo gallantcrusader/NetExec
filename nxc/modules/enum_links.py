@@ -1,4 +1,7 @@
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -12,44 +15,45 @@ class NXCModule:
     supported_protocols = ["mssql"]
     category = CATEGORY.ENUMERATION
 
-    def __init__(self):
-        self.mssql_conn = None
-        self.context = None
+    @dataclass
+    class ResultData:
+        servers: list[dict]
+        login_mappings: list[dict]
+        login_mappings_queried: bool
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         pass
 
     def on_login(self, context, connection):
-        self.context = context
-        self.mssql_conn = connection.conn
-        linked_servers = self.get_linked_servers()
-        if linked_servers:
-            self.context.log.success("Linked servers found:")
-            for server in linked_servers:
-                self.context.log.display(f"  - {server}")
-        else:
-            self.context.log.fail("No linked servers found.")
-
-        if connection.admin_privs:
-            res = self.mssql_conn.sql_query("EXEC sp_helplinkedsrvlogin")
-            srvs = [srv for srv in res if srv["Local Login"] is not None]
-            if not srvs:
-                self.context.log.fail("No linked servers found.")
-                return
-            self.context.log.success("Linked servers found:")
-            for srv in srvs:
-                self.context.log.display(f"Linked server: {srv['Linked Server']}")
-                self.context.log.display(f"  - Local login: {srv['Local Login']}")
-                self.context.log.display(f"  - Remote login: {srv['Remote Login']}")
-
-    def get_linked_servers(self) -> list:
-        """
-        Fetches a list of linked servers.
-
-        Returns
-        -------
-        list: List of linked server names.
-        """
-        query = "EXEC sp_linkedservers;"
-        res = self.mssql_conn.sql_query(query)
-        return [server["SRV_NAME"] for server in res] if res else []
+        servers = []
+        mappings = []
+        errors = []
+        mappings_queried = False
+        try:
+            servers = connection.conn.sql_query("EXEC sp_linkedservers;") or []
+            if connection.conn.lastError:
+                errors.append(str(connection.conn.lastError))
+            for server in servers:
+                context.log.display(f"Linked server: {server['SRV_NAME']}")
+            if connection.admin_privs and not errors:
+                mappings_queried = True
+                mappings = connection.conn.sql_query("EXEC sp_helplinkedsrvlogin") or []
+                if connection.conn.lastError:
+                    errors.append(str(connection.conn.lastError))
+                for mapping in mappings:
+                    context.log.display(f"Linked server: {mapping['Linked Server']}")
+                    context.log.display(f"  - Local login: {mapping['Local Login']}")
+                    context.log.display(f"  - Remote login: {mapping['Remote Login']}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        for error in errors:
+            context.log.fail(error)
+        if not servers and not errors:
+            context.log.display("No linked servers found.")
+        return ActionResult(
+            "mssql", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if servers or mappings else ResultStatus.NEGATIVE,
+            self.ResultData(servers, mappings, mappings_queried), error="; ".join(errors) or None,
+        )

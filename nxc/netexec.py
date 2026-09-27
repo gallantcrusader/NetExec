@@ -14,6 +14,7 @@ from nxc.console import nxc_console
 from nxc.logger import nxc_logger
 from nxc.config import nxc_config, nxc_workspace, config_log
 from nxc.database import create_db_engine
+from nxc.playbooks.runner import main as playbook_main
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 from nxc.helpers import powershell
@@ -81,6 +82,8 @@ def ctrl_c(sig, frame):
 def main():
     signal.signal(signal.SIGINT, ctrl_c)
     first_run_setup(nxc_logger)
+    if len(sys.argv) > 1 and sys.argv[1] == "playbook":
+        exit(playbook_main(sys.argv[2:]))
     args, version_info = gen_cli_args()
 
     # if these are the same, it might double log to file (two FileHandlers will be added)

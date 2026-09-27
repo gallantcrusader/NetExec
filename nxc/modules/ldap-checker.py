@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 import socket
 import ssl
 import asyncio
@@ -27,6 +28,7 @@ class NXCModule:
     description = "[REMOVED] Checks whether LDAP signing and channel binding are required and / or enforced"
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
+    result_type = RetiredModuleData
 
     def options(self, context, module_options):
         """No options available."""
@@ -174,7 +176,7 @@ class NXCModule:
     # enumerate LDAP signing and channel binding settings
     def on_login(self, context, connection):
         context.log.fail("[REMOVED] Now natively supported in the host banner")
-        return
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("connection:ldap"), error="[REMOVED] Now natively supported in the host banner")
         stype = asyauthSecret.PASS
         secret = connection.password
         if connection.nthash:

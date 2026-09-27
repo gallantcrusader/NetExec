@@ -1,3 +1,6 @@
+from nxc.playbooks.screenshots import ScreenshotData, capture_screenshot
+from nxc.playbooks.results import ActionResult, ResultStatus
+
 import asyncio
 import contextlib
 from datetime import datetime
@@ -30,7 +33,7 @@ from asysocks.unicomm.client import UniClient
 
 
 class rdp(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.domain = None
         self.server_os = None
         self.iosettings = RDPIOSettings()
@@ -81,7 +84,7 @@ class rdp(connection):
             "KDC_ERR_PREAUTH_FAILED": "KDC_ERR_PREAUTH_FAILED",
         }
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         import platform
@@ -273,6 +276,16 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.domain = domain
+            self.password = password if not ntlm_hash and not useCache else ""
+            if ntlm_hash:
+                self.hash = ntlm_hash
+                self.db.add_credential("hash", domain, username, ntlm_hash)
+            elif self.password:
+                self.db.add_credential("plaintext", domain, username, self.password)
+            elif aesKey:
+                self.db.add_credential("aesKey", domain, username, aesKey)
             self.logger.success(
                 "{}\\{}{} {}".format(
                     domain,
@@ -329,6 +342,10 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.domain = domain
+            self.password = password
+            self.db.add_credential("plaintext", domain, username, password)
             self.logger.success(f"{domain}\\{username}:{process_secret(password)} {self.mark_pwned()}")
             if not self.args.local_auth and self.username != "":
                 add_user_bh(username, domain, self.logger, self.config)
@@ -363,6 +380,10 @@ class rdp(connection):
             asyncio.run(self.connect_rdp_with_cleanup())
 
             self.admin_privs = True
+            self.username = username
+            self.domain = domain
+            self.hash = ntlm_hash
+            self.db.add_credential("hash", domain, username, ntlm_hash)
             self.logger.success(f"{self.domain}\\{username}:{process_secret(ntlm_hash)} {self.mark_pwned()}")
             if not self.args.local_auth and self.username != "":
                 add_user_bh(username, domain, self.logger, self.config)
@@ -590,26 +611,34 @@ class rdp(connection):
             await asyncio.sleep(5)
             if self.conn is not None and self.conn.desktop_buffer_has_data is True:
                 buffer = self.conn.get_desktop_buffer(VIDEO_FORMAT.PIL)
-                filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.png").expanduser()
+                filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S_%f')}.png").expanduser()
+                await filename.parent.mkdir(parents=True, exist_ok=True)
                 buffer.save(filename, "png")
                 self.logger.highlight(f"Screenshot saved {filename}")
+                return filename
         except Exception as e:
             self.logger.debug(f"Error taking screenshot: {e!s}")
+            if self.playbook_mode:
+                raise
         finally:
             await self.terminate_conn()
 
     def screenshot(self):
+        if self.playbook_mode:
+            return capture_screenshot("rdp", "screenshot", self.host, self.screen)
         asyncio.run(self.screen())
 
     async def nla_screen(self):
         self.auth = NTLMCredential(secret="", username="", domain="", stype=asyauthSecret.PASS)
 
+        errors = []
         for proto in self.protoflags_nla:
             try:
                 self.iosettings.supported_protocols = proto
                 self.conn = RDPConnection(iosettings=self.iosettings, target=self.target, credentials=self.auth)
                 await self.connect_rdp()
             except Exception as e:
+                errors.append(str(e) or type(e).__name__)
                 self.logger.debug(f"Failed to connect for nla_screenshot with {proto} {e}")
                 await self.terminate_conn()
                 continue
@@ -618,13 +647,28 @@ class rdp(connection):
                 await asyncio.sleep(int(self.args.screentime))
                 if self.conn is not None and self.conn.desktop_buffer_has_data is True:
                     buffer = self.conn.get_desktop_buffer(VIDEO_FORMAT.PIL)
-                    filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.png").expanduser()
+                    filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S_%f')}.png").expanduser()
+                    await filename.parent.mkdir(parents=True, exist_ok=True)
                     buffer.save(filename, "png")
                     self.logger.highlight(f"NLA Screenshot saved {filename}")
-                    return
+                    return filename
             finally:
                 await self.terminate_conn()
 
+        if errors and self.playbook_mode:
+            raise RuntimeError("; ".join(errors))
+
     def nla_screenshot(self):
-        if not self.nla:
-            asyncio.run(self.nla_screen())
+        if self.nla:
+            if self.playbook_mode:
+                return ActionResult("rdp", "nla_screenshot", self.host, ResultStatus.SKIPPED, ScreenshotData(None, False))
+            return None
+        auth = self.auth
+        protocols = self.iosettings.supported_protocols
+        try:
+            if self.playbook_mode:
+                return capture_screenshot("rdp", "nla_screenshot", self.host, self.nla_screen)
+            return asyncio.run(self.nla_screen())
+        finally:
+            self.auth = auth
+            self.iosettings.supported_protocols = protocols

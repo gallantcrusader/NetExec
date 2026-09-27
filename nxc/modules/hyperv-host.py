@@ -1,7 +1,8 @@
-from impacket.dcerpc.v5.rpcrt import DCERPCException
-from impacket.dcerpc.v5 import rrp
-from impacket.examples.secretsdump import RemoteOperations
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import RegistryValue, read_registry_value
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -12,42 +13,27 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
-    def __init__(self, context=None, module_options=None):
-        self.context = context
-        self.module_options = module_options
+    @dataclass
+    class ResultData:
+        hostname: str | None
+        registry: RegistryValue
+
+    result_type = ResultData
 
     def options(self, context, module_options):
-        """"""
+        """No options available"""
 
     def on_admin_login(self, context, connection):
-        self.context = context
-
-        path = "SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters"
-        key = "HostName"
-
-        try:
-            remote_ops = RemoteOperations(connection.conn, False)
-            remote_ops.enableRegistry()
-
-            ans = rrp.hOpenLocalMachine(remote_ops._RemoteOperations__rrp)
-            reg_handle = ans["phKey"]
-
-            # Query
-            try:
-                ans = rrp.hBaseRegOpenKey(remote_ops._RemoteOperations__rrp, reg_handle, path)
-                key_handle = ans["phkResult"]
-
-                data_type, reg_value = rrp.hBaseRegQueryValue(remote_ops._RemoteOperations__rrp, key_handle, key)
-                self.context.log.highlight(f"{key}: {reg_value}")
-
-                rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-
-            except DCERPCException as e:
-                self.context.log.debug(f"Registry key {path}\\{key} does not exist: {e}")
-
-        except DCERPCException as e:
-            self.context.log.fail(f"DCERPC Error while querying registry: {e}")
-        except Exception as e:
-            self.context.log.fail(f"Error while querying registry: {e}")
-        finally:
-            remote_ops.finish()
+        value = read_registry_value(connection, r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters", "HostName")
+        hostname = value.value.rstrip("\x00") if isinstance(value.value, str) else None
+        if value.error:
+            context.log.fail(value.error)
+        elif value.present:
+            context.log.highlight(f"HostName: {value.value}")
+        else:
+            context.log.display("Hyper-V host registry value is absent")
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if value.error else ResultStatus.SUCCESS if value.present else ResultStatus.NEGATIVE,
+            self.ResultData(hostname, value), error=value.error,
+        )

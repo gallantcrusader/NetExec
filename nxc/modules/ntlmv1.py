@@ -1,55 +1,37 @@
-from impacket.dcerpc.v5 import rrp
-from impacket.examples.secretsdump import RemoteOperations
-from impacket.dcerpc.v5.rrp import DCERPCSessionError
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import RegistryValue, read_registry_value
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
-    """
-    Detect if the target's LmCompatibilityLevel will allow NTLMv1 authentication
-    Module by @Tw1sm
-    Modified by Deft (08/02/2024)
-    """
+    """Read LmCompatibilityLevel. Originally by Tw1sm; modified by Deft."""
 
     name = "ntlmv1"
-    description = "Detect if lmcompatibilitylevel on the target is set to lower than 3 (which means ntlmv1 is enabled)"
+    description = "Read the configured LmCompatibilityLevel registry value"
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        registry: RegistryValue
+
+    result_type = ResultData
+
     def options(self, context, module_options):
-        self.output = "NTLMv1 allowed on: {} - LmCompatibilityLevel = {}"
+        """No options available"""
 
     def on_admin_login(self, context, connection):
-        try:
-            remote_ops = RemoteOperations(connection.conn, False)
-            remote_ops.enableRegistry()
-
-            if remote_ops._RemoteOperations__rrp:
-                ans = rrp.hOpenLocalMachine(remote_ops._RemoteOperations__rrp)
-                reg_handle = ans["phKey"]
-                ans = rrp.hBaseRegOpenKey(
-                    remote_ops._RemoteOperations__rrp,
-                    reg_handle,
-                    "SYSTEM\\CurrentControlSet\\Control\\Lsa",
-                )
-                key_handle = ans["phkResult"]
-                rtype = data = None
-                try:
-                    rtype, data = rrp.hBaseRegQueryValue(
-                        remote_ops._RemoteOperations__rrp,
-                        key_handle,
-                        "lmcompatibilitylevel\x00",
-                    )
-
-                except rrp.DCERPCSessionError:
-                    context.log.debug("Unable to reference lmcompatabilitylevel, which probably means ntlmv1 is not set")
-
-                # Changed by Defte
-                # Unless this keys is set to 3 or higher, NTLMv1 can be used
-                if data in [0, 1, 2]:
-                    context.log.highlight(self.output.format(connection.conn.getRemoteHost(), data))
-
-        except DCERPCSessionError as e:
-            context.log.debug(f"Error connecting to RemoteRegistry: {e}")
-        finally:
-            remote_ops.finish()
+        value = read_registry_value(connection, r"SYSTEM\CurrentControlSet\Control\Lsa", "LmCompatibilityLevel")
+        if value.error:
+            context.log.fail(value.error)
+        elif value.present:
+            context.log.highlight(f"Configured LmCompatibilityLevel: {value.value}")
+        else:
+            context.log.display("LmCompatibilityLevel is not explicitly configured in this registry value")
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if value.error else ResultStatus.SUCCESS if value.present else ResultStatus.NEGATIVE,
+            self.ResultData(value), error=value.error,
+        )

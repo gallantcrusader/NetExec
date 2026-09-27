@@ -1,132 +1,83 @@
 import re
-from impacket.ldap import ldap, ldapasn1
-from impacket.ldap.ldap import LDAPSearchError
+from dataclasses import dataclass
+
+from ldap3.utils.conv import escape_filter_chars
+from ldap3.utils.dn import escape_rdn
 from nxc.helpers.misc import CATEGORY
+from nxc.parsers.ldap_results import parse_result_attributes
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
-    """
-    Find PKI Enrollment Services in Active Directory and Certificate Templates Names.
-
-    Module by Tobias Neitzel (@qtc_de) and Sam Freeside (@snovvcrash)
-    """
+    """Find PKI enrollment services and templates. By @qtc_de and @snovvcrash."""
 
     name = "adcs"
     description = "Find PKI Enrollment Services in Active Directory and Certificate Templates Names"
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        base_dn: str
+        server: str | None
+        services: list[dict]
+        templates: list[str]
+
+    result_type = ResultData
+
     def __init__(self, context=None, module_options=None):
-        self.context = context
-        self.module_options = module_options
         self.server = None
-        self.regex = None
+        self.base_dn = None
 
     def options(self, context, module_options):
         """
         SERVER             PKI Enrollment Server to enumerate templates for. Default is None, use CN name
         BASE_DN            The base domain name for the LDAP query
         """
-        self.regex = re.compile(r"(https?://.+)")
-
-        self.server = None
-        self.base_dn = None
-        if module_options and "SERVER" in module_options:
-            self.server = module_options["SERVER"]
-        if module_options and "BASE_DN" in module_options:
-            self.base_dn = module_options["BASE_DN"]
+        self.server = module_options.get("SERVER")
+        self.base_dn = module_options.get("BASE_DN")
 
     def on_login(self, context, connection):
-        """On a successful LDAP login we perform a search for all PKI Enrollment Server or Certificate Templates Names."""
-        self.context = context
-        if self.server is None:
-            search_filter = "(objectClass=pKIEnrollmentService)"
-        else:
-            search_filter = f"(distinguishedName=CN={self.server},CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,"
-            self.context.log.highlight(f"Using PKI CN: {self.server}")
-
+        base_dn = "CN=Configuration," + (self.base_dn if self.base_dn is not None else connection.baseDN)
+        search_filter = "(objectClass=pKIEnrollmentService)"
+        if self.server is not None:
+            server_dn = f"CN={escape_rdn(self.server)},CN=Enrollment Services,CN=Public Key Services,CN=Services,{base_dn}"
+            search_filter = f"(&(objectClass=pKIEnrollmentService)(distinguishedName={escape_filter_chars(server_dn)}))"
+            context.log.highlight(f"Using PKI CN: {self.server}")
         context.log.display(f"Starting LDAP search with search filter '{search_filter}'")
-
-        try:
-            sc = ldap.SimplePagedResultsControl()
-            base_dn_root = connection.ldap_connection._baseDN if self.base_dn is None else self.base_dn
-
+        entries = parse_result_attributes(connection.search(
+            search_filter,
+            ["distinguishedName", "cn", "dNSHostName", "msPKI-Enrollment-Servers", "certificateTemplates"],
+            baseDN=base_dn,
+        ))
+        services, templates = [], []
+        for entry in entries:
+            values = entry.get("msPKI-Enrollment-Servers", [])
+            values = values if isinstance(values, list) else [values]
+            urls = [match.group(0) for value in values for match in re.finditer(r"https?://[^\r\n]+", value)]
+            names = entry.get("certificateTemplates", [])
+            names = names if isinstance(names, list) else [names]
+            services.append({"attributes": entry, "urls": urls, "templates": names})
+            for name in names:
+                if name not in templates:
+                    templates.append(name)
             if self.server is None:
-                connection.ldap_connection.search(
-                    searchFilter=search_filter,
-                    attributes=[],
-                    sizeLimit=0,
-                    searchControls=[sc],
-                    perRecordCallback=self.process_servers,
-                    searchBase="CN=Configuration," + base_dn_root,
-                )
+                if entry.get("dNSHostName"):
+                    context.log.highlight(f"Found PKI Enrollment Server: {entry['dNSHostName']}")
+                if entry.get("cn"):
+                    context.log.highlight(f"Found CN: {entry['cn']}")
+                for url in urls:
+                    context.log.highlight(f"Found PKI Enrollment WebService: {url}")
             else:
-                connection.ldap_connection.search(
-                    searchFilter=search_filter + base_dn_root + ")",
-                    attributes=["certificateTemplates"],
-                    sizeLimit=0,
-                    searchControls=[sc],
-                    perRecordCallback=self.process_templates,
-                    searchBase="CN=Configuration," + base_dn_root,
-                )
-        except LDAPSearchError as e:
-            if "noSuchObject" in str(e):
-                context.log.fail("No ADCS infrastructure found.")
-            else:
-                context.log.fail(f"Obtained unexpected exception: {e}")
-
-    def process_servers(self, item):
-        """Function that is called to process the items obtain by the LDAP search when listing PKI Enrollment Servers."""
-        if not isinstance(item, ldapasn1.SearchResultEntry):
-            return
-
-        urls = []
-        host_name = None
-        cn = None
-
-        try:
-            for attribute in item["attributes"]:
-                if str(attribute["type"]) == "dNSHostName":
-                    host_name = attribute["vals"][0].asOctets().decode("utf-8")
-                if str(attribute["type"]) == "cn":
-                    cn = attribute["vals"][0].asOctets().decode("utf-8")
-                elif str(attribute["type"]) == "msPKI-Enrollment-Servers":
-                    values = attribute["vals"]
-
-                    for value in values:
-                        value = value.asOctets().decode("utf-8")
-                        match = self.regex.search(value)
-                        if match:
-                            urls.append(match.group(1))
-        except Exception as e:
-            entry = host_name or "item"
-            self.context.log.fail(f"Skipping {entry}, cannot process LDAP entry due to error: '{e!s}'")
-
-        if host_name:
-            self.context.log.highlight(f"Found PKI Enrollment Server: {host_name}")
-        if cn:
-            self.context.log.highlight(f"Found CN: {cn}")
-        for url in urls:
-            self.context.log.highlight(f"Found PKI Enrollment WebService: {url}")
-
-    def process_templates(self, item):
-        """Function that is called to process the items obtain by the LDAP search when listing Certificate Templates Names for a specific PKI Enrollment Server."""
-        if not isinstance(item, ldapasn1.SearchResultEntry):
-            return
-
-        templates = []
-        template_name = None
-
-        try:
-            for attribute in item["attributes"]:
-                if str(attribute["type"]) == "certificateTemplates":
-                    for val in attribute["vals"]:
-                        template_name = val.asOctets().decode("utf-8")
-                        templates.append(template_name)
-        except Exception as e:
-            entry = template_name or "item"
-            self.context.log.fail(f"Skipping {entry}, cannot process LDAP entry due to error: '{e}'")
-
-        if templates:
-            for t in templates:
-                self.context.log.highlight(f"Found Certificate Template: {t}")
+                for name in names:
+                    context.log.highlight(f"Found Certificate Template: {name}")
+        error = connection.last_search_error
+        if error:
+            context.log.fail(error)
+        elif not entries:
+            context.log.display("No matching PKI enrollment services found.")
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS if entries else ResultStatus.NEGATIVE,
+            self.ResultData(base_dn, self.server, services, templates), error=error,
+        )

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from pathlib import Path
 from nxc.helpers.misc import CATEGORY
 from nxc.paths import NXC_PATH
-import socket
+from nxc.helpers.path import sanitize_filename
+from nxc.parsers.ldap_results import parse_result_attributes
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
 
 class NXCModule:
@@ -16,9 +20,18 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        computers: list[dict]
+        search_filter: str
+
+    result_type = ResultData
+
     def ldap_time_to_datetime(self, ldap_time):
         """Convert an LDAP timestamp to a datetime object."""
-        if ldap_time == "0":  # Account for never-set passwords
+        if ldap_time is None:
+            return None
+        if str(ldap_time) == "0":  # Account for never-set passwords
             return "Never"
         try:
             epoch = datetime(1601, 1, 1) + timedelta(seconds=int(ldap_time) / 10000000)
@@ -38,47 +51,41 @@ class NXCModule:
                          "(operatingSystem=*Windows Server 2008*)(operatingSystem=*Windows Server 2012*)))")
         attributes = ["name", "operatingSystem", "dNSHostName", "pwdLastSet"]
 
-        try:
-            context.log.debug(f"Search Filter={search_filter}")
-            resp = connection.ldap_connection.search(searchFilter=search_filter, attributes=attributes, sizeLimit=0)
-        except Exception:
-            context.log.error("LDAP search error:", exc_info=True)
-            return False
-
-        answers = []
-        context.log.debug(f"Total of records returned {len(resp)}")
-
-        for item in resp:
-            if "attributes" not in item:
+        context.log.debug(f"Search Filter={search_filter}")
+        response = connection.search(searchFilter=search_filter, attributes=attributes)
+        errors = [connection.last_search_error] if connection.last_search_error else []
+        computers = []
+        artifacts = []
+        for item in parse_result_attributes(response):
+            hostname = item.get("dNSHostName")
+            if not hostname or not item.get("operatingSystem"):
                 continue
-            dns_hostname, pwd_last_set = "", "0"  # Default '0' for pwdLastSet
-            for attribute in item["attributes"]:
-                attr_type = str(attribute["type"])
-                if attr_type == "operatingSystem":
-                    os = str(attribute["vals"][0])
-                elif attr_type == "dNSHostName":
-                    dns_hostname = str(attribute["vals"][0])
-                elif attr_type == "pwdLastSet":
-                    pwd_last_set = str(attribute["vals"][0])
-
-            if dns_hostname and os:
-                pwd_last_set_readable = self.ldap_time_to_datetime(pwd_last_set)
-                try:
-                    ip_address = socket.gethostbyname(dns_hostname)
-                    answers.append((dns_hostname, ip_address, os, pwd_last_set_readable))
-                except socket.gaierror:
-                    answers.append((dns_hostname, "N/A", os, pwd_last_set_readable))
-
-        if answers:
-            obsolete_hosts_count = len(answers)
-            filename = f"{NXC_PATH}/logs/{connection.domain}.obsoletehosts.txt"
-            context.log.display(f"{obsolete_hosts_count} Obsolete hosts will be saved to {filename}")
-            with open(filename, "w") as f:
-                for dns_hostname, ip_address, os, pwd_last_set_readable in answers:
-                    log_message = f"{dns_hostname} ({ip_address}) : {os} [pwd-last-set: {pwd_last_set_readable}]"
-                    context.log.highlight(log_message)
-                    f.write(log_message + "\n")
+            resolved = connection.resolver(hostname)
+            address = resolved.get("host") if resolved else None
+            computer = {**item, "address": address, "pwdLastSet_readable": self.ldap_time_to_datetime(item.get("pwdLastSet")), "resolution_error": None}
+            if address is None:
+                computer["resolution_error"] = f"No address resolved for {hostname}"
+                errors.append(computer["resolution_error"])
+            computers.append(computer)
+        if computers:
+            filename = Path(NXC_PATH) / "logs" / f"{sanitize_filename(connection.domain)}-{sanitize_filename(connection.host)}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.obsoletehosts.txt"
+            try:
+                filename.parent.mkdir(parents=True, exist_ok=True)
+                with filename.open("w") as output:
+                    for computer in computers:
+                        line = f"{computer['dNSHostName']} ({computer['address'] or 'N/A'}) : {computer['operatingSystem']} [pwd-last-set: {computer['pwdLastSet_readable'] or 'Unknown'}]"
+                        context.log.highlight(line)
+                        output.write(line + "\n")
+                artifacts.append(Artifact(filename, "obsolete_hosts"))
+                context.log.display(f"Saved {len(computers)} matching hosts to {filename}")
+            except Exception as e:
+                errors.append(str(e) or type(e).__name__)
         else:
             context.log.display("No Obsolete Hosts Identified")
-
-        return True
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if computers else ResultStatus.NEGATIVE,
+            self.ResultData(computers, search_filter), artifacts=artifacts, error="; ".join(errors) or None,
+        )

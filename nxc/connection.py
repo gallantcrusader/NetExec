@@ -15,6 +15,9 @@ from socket import AF_UNSPEC, SOCK_DGRAM, IPPROTO_IP, AI_CANONNAME, getaddrinfo
 from nxc.config import pwned_label
 from nxc.helpers.logger import highlight
 from nxc.loaders.moduleloader import ModuleLoader, ModuleOptionsError
+from nxc.playbooks.contracts import validate_module_result
+from nxc.playbooks.capture import RecordingLogger, captured_result
+from nxc.playbooks.results import OutputEvent, ResultStatus
 from nxc.logger import nxc_logger, NXCAdapter
 from nxc.context import Context
 from nxc.paths import NXC_PATH
@@ -97,7 +100,9 @@ def requires_admin(func):
             return None
         return func(self, *args, **kwargs)
 
-    return wraps(func)(_decorator)
+    decorated = wraps(func)(_decorator)
+    decorated.requires_admin = True
+    return decorated
 
 
 def dcom_FirewallChecker(iInterface, remoteHost, timeout):
@@ -132,7 +137,7 @@ def dcom_FirewallChecker(iInterface, remoteHost, timeout):
 
 
 class connection:
-    def __init__(self, args, db, target):
+    def __init__(self, args, db, target, defer_flow=False):
         self.args = args
         self.db = db
         self.logger = nxc_logger
@@ -140,10 +145,18 @@ class connection:
         self.output_file_template = None
         self.output_filename = None
         self.protocol = args.protocol
+        self.playbook_mode = getattr(args, "playbook_mode", False)
+        self.action_results = []
+        self.connection_events = []
+        self.capture_connection_logger()
+        self.session_open = False
+        self.transport_open = False
 
         # Authentication info
         self.password = ""
         self.username = ""
+        self.authenticated_credential_type = None
+        self.authenticated_secret = None
         self.kerberos = bool(self.args.kerberos or
                              self.args.use_kcache or
                              self.args.aesKey or
@@ -177,6 +190,9 @@ class connection:
 
         self.logger.debug(f"Socket info: host={self.host}, hostname={self.hostname}, kerberos={self.kerberos}, ipv6={self.is_ipv6}, link-local ipv6={self.is_link_local_ipv6}")
 
+        if defer_flow:
+            return
+
         try:
             self.proto_flow()
         except FileNotFoundError as e:
@@ -208,6 +224,11 @@ class connection:
         except Exception as e:
             self.logger.info(f"Error resolving hostname {target}: {e}")
             return None
+
+    def capture_connection_logger(self):
+        """Retain connection messages while forwarding them to NetExec's logger."""
+        if self.playbook_mode and not isinstance(self.logger, RecordingLogger):
+            self.logger = RecordingLogger(self.logger, self.connection_events)
 
     @staticmethod
     def proto_args(std_parser, module_parser):
@@ -266,6 +287,37 @@ class connection:
                     self.call_modules()
             self.disconnect()
 
+    def open_session(self, anonymous=False):
+        """Open a protocol session for a playbook without running CLI actions."""
+        if not self.host:
+            return False
+        self.proto_logger()
+        self.capture_connection_logger()
+        if not self.create_conn_obj():
+            return False
+        self.transport_open = True
+        self.enum_host_info()
+        base_log_dir = os.path.join(NXC_PATH, "logs")
+        filename_pattern = f"{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}".replace(":", "-")
+        self.output_file_template = os.path.join(base_log_dir, "{output_folder}", filename_pattern)
+        self.output_filename = os.path.join(base_log_dir, filename_pattern)
+        self.print_host_info()
+        authenticated = self.login()
+        successful_login = bool(authenticated or self.authenticated_credential_type)
+        self.session_open = successful_login if anonymous else bool(successful_login or (self.username == "" and self.password == "" and self.protocol != "mssql"))
+        return self.session_open
+
+    def close_session(self):
+        """Close a playbook session after the host workflow finishes."""
+        if self.session_open:
+            self.disconnect()
+        with contextlib.suppress(Exception):
+            self.conn.close()
+        with contextlib.suppress(Exception):
+            self.ldap_connection.close()
+        self.session_open = False
+        self.transport_open = False
+
     def call_cmd_args(self):
         """Calls all the methods specified by the command line arguments
 
@@ -310,11 +362,54 @@ class connection:
 
             if hasattr(module, "on_login"):
                 self.logger.debug(f"Module {module.name} has on_login method")
-                module.on_login(context, self)
+                if not self.run_module_hook(module, "on_login", context, module_logger, include_options=True):
+                    continue
 
             if self.admin_privs and hasattr(module, "on_admin_login"):
                 self.logger.debug(f"Module {module.name} has on_admin_login method")
-                module.on_admin_login(context, self)
+                self.run_module_hook(module, "on_admin_login", context, module_logger, include_options=not hasattr(module, "on_login"))
+
+    def run_module_hook(self, module, hook_name, context, module_logger, include_options=False):
+        """Run a module hook and capture its legacy output in playbook mode."""
+        original_logger = self.logger
+        events = list(getattr(module, "option_events", [])) if include_options and self.playbook_mode else []
+        if self.playbook_mode:
+            session = getattr(self, "playbook_session", None)
+            context.session = session
+            context.playbook = session.host if session is not None else None
+            context.credential = getattr(session.result.data, "credential", None) if session is not None else None
+            context.log = RecordingLogger(module_logger, events)
+            self.logger = RecordingLogger(original_logger, events)
+        try:
+            result = getattr(module, hook_name)(context, self)
+        except (Exception, SystemExit) as e:
+            if not self.playbook_mode:
+                raise
+            events.append(OutputEvent("exception", str(e) or type(e).__name__))
+            failed = captured_result(self.args.protocol, module.name, self.host, None, events)
+            failed.hook = hook_name
+            self.action_results.append(failed)
+            return not getattr(self, "playbook_stop_on_error", True)
+        finally:
+            self.logger = original_logger
+        if self.playbook_mode:
+            if getattr(module, "result_type", None) is not None:
+                try:
+                    validated = validate_module_result(module, result, self.args.protocol, self.host)
+                    validated.events.extend(events)
+                    self.action_results.append(validated)
+                except (Exception, SystemExit) as e:
+                    events.append(OutputEvent("exception", str(e) or type(e).__name__))
+                    failed = captured_result(self.args.protocol, module.name, self.host, None, events)
+                    failed.hook = hook_name
+                    self.action_results.append(failed)
+                    return not getattr(self, "playbook_stop_on_error", True)
+            else:
+                self.action_results.append(captured_result(self.args.protocol, module.name, self.host, result, events))
+            self.action_results[-1].hook = hook_name
+            if self.action_results[-1].status is ResultStatus.FAILED:
+                return not getattr(self, "playbook_stop_on_error", True)
+        return True
 
     def inc_failed_login(self, username):
         global global_failed_logins, user_failed_logins
@@ -357,28 +452,31 @@ class connection:
         owned = []
         secrets = []
         cred_types = []
-        creds = []  # list of tuples (cred_id, domain, username, secret, cred_type, pillaged_from) coming from the database
+        creds = []
         data = []  # Arbitrary data needed for the login, e.g. ssh_key
 
         for cred_id in self.args.cred_id:
-            if cred_id.lower() == "all":
+            if str(cred_id).lower() == "all":
                 creds = self.db.get_credentials()
             else:
-                if not self.db.get_credentials(filter_term=int(cred_id)):
+                matching = [row for row in self.db.get_credentials(filter_term=int(cred_id)) if row.id == int(cred_id)]
+                if not matching:
                     self.logger.error(f"Invalid database credential ID {cred_id}!")
                     continue
-                creds.extend(self.db.get_credentials(filter_term=int(cred_id)))
+                creds.extend(matching)
 
         for cred in creds:
-            c_id, domain, username, secret, cred_type, pillaged_from = cred
-            domains.append(domain)
-            usernames.append(username)
-            owned.append(False)  # As these are likely valid we still want to test them if they are specified in the command line
-            secrets.append(secret)
-            cred_types.append(cred_type)
-
-        if len(secrets) != len(data):
-            data = [None] * len(secrets)
+            cred_type = getattr(cred, "credtype", "plaintext")
+            key_data = self.db.get_keys(cred_id=cred.id) if cred_type == "key" else [None]
+            if not key_data:
+                self.logger.error(f"Credential ID {cred.id} has no associated key")
+            for key in key_data:
+                domains.append(getattr(cred, "domain", None))
+                usernames.append(cred.username)
+                owned.append(False)
+                secrets.append(cred.password)
+                cred_types.append(cred_type)
+                data.append(key.data if key is not None else None)
 
         return domains, usernames, owned, secrets, cred_types, data
 
@@ -523,6 +621,8 @@ class connection:
                 return self.hash_login(domain, username, secret)
             elif cred_type == "aesKey":
                 return self.kerberos_login(domain, username, "", "", secret, self.kdcHost, False)
+            elif cred_type == "key" and self.args.protocol == "ssh":
+                return self.plaintext_login(username, secret, data)
 
     def login(self):
         """Try to login using the credentials specified in the command line or in the database.
@@ -561,9 +661,11 @@ class connection:
             with sem:
                 username = self.args.username[0] if len(self.args.username) else CCache.parseFile()[1]
                 password = self.args.password[0] if len(self.args.password) else ""
-                self.kerberos_login(self.domain, username, password, "", "", self.kdcHost, True)
-                self.logger.info("Successfully authenticated using Kerberos cache")
-                return True
+                authenticated = self.kerberos_login(self.domain, username, password, "", "", self.kdcHost, True)
+                if authenticated:
+                    self.authenticated_credential_type = "ccache"
+                    self.logger.info("Successfully authenticated using Kerberos cache")
+                return authenticated
 
         if self.args.pfx_cert or self.args.pfx_base64 or self.args.pem_cert:
             self.logger.debug("Trying to authenticate using Certificate pfx")
@@ -571,7 +673,10 @@ class connection:
                 self.logger.fail("You must specify a username when using certificate authentication")
                 return False
             with sem:
-                return pfx_auth(self)
+                authenticated = pfx_auth(self)
+                if authenticated:
+                    self.authenticated_credential_type = "certificate"
+                return authenticated
 
         if hasattr(self.args, "laps") and self.args.laps:
             self.logger.debug("Trying to authenticate using LAPS")
@@ -584,6 +689,8 @@ class connection:
             for secr_index, secr in enumerate(secret):
                 for user_index, user in enumerate(username):
                     if self.try_credentials(domain[user_index], user, owned[user_index], secr, cred_type[secr_index], data[secr_index]):
+                        self.authenticated_credential_type = cred_type[secr_index]
+                        self.authenticated_secret = secr
                         owned[user_index] = True
                         if not self.args.continue_on_success:
                             return True
@@ -592,7 +699,9 @@ class connection:
                 self.logger.error("Number provided of usernames and passwords/hashes do not match!")
                 return False
             for user_index, user in enumerate(username):
-                if self.try_credentials(domain[user_index], user, owned[user_index], secret[user_index], cred_type[user_index], data[user_index]) and not self.args.continue_on_success:
+                if self.try_credentials(domain[user_index], user, owned[user_index], secret[user_index], cred_type[user_index], data[user_index]):
+                    self.authenticated_credential_type = cred_type[user_index]
+                    self.authenticated_secret = secret[user_index]
                     owned[user_index] = True
                     if not self.args.continue_on_success:
                         return True
@@ -609,6 +718,9 @@ class connection:
             try:
                 module = loader.init_module(module_path)
             except ModuleOptionsError as e:
+                if self.playbook_mode:
+                    raise
                 self.logger.debug(f"Skipping module: {e}")
                 continue
-            self.modules.append(module)
+            if module is not None:
+                self.modules.append(module)

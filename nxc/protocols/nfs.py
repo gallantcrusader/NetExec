@@ -1,4 +1,7 @@
+from dataclasses import dataclass
+from copy import deepcopy
 from io import BytesIO
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 from termcolor import colored
 from nxc.connection import connection
@@ -20,7 +23,6 @@ from pyNfsClient.const import (
     NFS3ERR_NOENT,
     NF3REG,
 )
-import re
 import uuid
 import math
 import os
@@ -72,8 +74,13 @@ fsid_lens = {
 }
 
 
+@dataclass
+class NFSSharesData:
+    shares: list[dict]
+
+
 class nfs(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.protocol = "nfs"
         self.port = 111
         self.portmap = None
@@ -90,7 +97,7 @@ class nfs(connection):
         # If root escape is possible, the escape_share and escape_fh will be populated
         self.escape_share = None
         self.escape_fh = b""
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -101,6 +108,7 @@ class nfs(connection):
                 "hostname": self.hostname,
             }
         )
+        self.capture_connection_logger()
 
     def create_conn_obj(self):
         """Initializes and connects to the portmap and mounted folder"""
@@ -165,10 +173,12 @@ class nfs(connection):
             self.logger.fail(f"Error during disconnect: {e}")
 
     def list_dir(self, file_handle, path, recurse=1):
+        if not hasattr(self, "listing_errors"):
+            self.listing_errors = []
         """Process entries in NFS directory recursively with UID autodection"""
         def process_entries(entries, path, uid, recurse):
+            contents = []
             try:
-                contents = []
                 for entry in entries:
                     if "name" in entry and entry["name"] not in [b".", b".."]:
                         item_path = f'{path}/{entry["name"].decode("utf-8")}'  # Constructing file path
@@ -192,6 +202,9 @@ class nfs(connection):
                 return contents
             except Exception as e:
                 self.logger.debug(f"Error on Listing Entries for NFS Shares: {self.host}:{self.port} {e}")
+                if self.playbook_mode:
+                    self.listing_errors.append(str(e) or type(e).__name__)
+                return contents
 
         attrs = self.nfs3.getattr(file_handle, auth=self.auth)
         self.auth["uid"] = attrs["attributes"]["uid"]
@@ -207,6 +220,16 @@ class nfs(connection):
             entries = items["resok"]["reply"]["entries"]
 
         return process_entries(entries, path, self.auth["uid"], recurse)
+
+    def export_records(self, export_nodes):
+        """Read export names and access groups directly from decoded XDR nodes."""
+        records = []
+        pending = list(reversed(export_nodes))
+        while pending:
+            node = pending.pop()
+            records.append((node.ex_dir.decode("utf-8"), self.group_names(node.ex_groups) or ["Everyone"]))
+            pending.extend(reversed(node.ex_next))
+        return records
 
     def export_info(self, export_nodes):
         """Enumerates all NFS shares and their access range"""
@@ -236,92 +259,138 @@ class nfs(connection):
         return result
 
     def shares(self):
+        records = []
+        errors = []
+        original_auth = self.auth.copy()
+        original_client = getattr(self, "nfs3", None)
+        client = None
         self.logger.display("Enumerating NFS Shares")
         try:
             # Connect to NFS
             nfs_port = self.portmap.getport(NFS_PROGRAM, NFS_V3)
             self.nfs3 = NFSv3(self.host, nfs_port, self.args.nfs_timeout, self.auth)
+            client = self.nfs3
             self.nfs3.connect()
 
-            output_export = str(self.mount.export())
-            networks = self.export_info(self.mount.export())
-
-            reg = re.compile(r"ex_dir=b'([^']*)'")  # Get share names
-            shares = list(reg.findall(output_export))
+            exports = self.export_records(self.mount.export())
 
             # Mount shares and check permissions
             self.logger.highlight(f"{'UID':<11}{'Perms':<9}{'Storage Usage':<17}{'Share':<30} {'Access List':<15}")
             self.logger.highlight(f"{'---':<11}{'-----':<9}{'-------------':<17}{'-----':<30} {'-----------':<15}")
-            for share, network in zip(shares, networks, strict=True):
+            for share, network in exports:
+                record = {"path": share, "networks": network, "mount_status": None, "uid": None, "permissions": None, "used_bytes": None, "total_bytes": None, "error": None}
+                records.append(record)
+                self.auth.update(original_auth)
+                mounted = False
                 try:
                     mnt_info = self.mount.mnt(share, self.auth)
+                    record["mount_status"] = mnt_info["status"]
                     self.logger.debug(f"Mounted {share} - {mnt_info}")
                     if mnt_info["status"] != 0:
                         self.logger.debug(f"Error mounting share {share}: {NFSSTAT3[mnt_info['status']]}")
                         self.logger.highlight(f"{'-':<11}{'---':<9}{'---'}/{'---':<12} {share:<30} {', '.join(network) if network else 'No network':<15}")
                     else:
+                        mounted = True
                         file_handle = mnt_info["mountinfo"]["fhandle"]
 
                         info = self.nfs3.fsstat(file_handle, self.auth)
                         free_space = info["resok"]["fbytes"]
                         total_space = info["resok"]["tbytes"]
                         used_space = total_space - free_space
+                        record.update(used_bytes=used_space, total_bytes=total_space)
 
                         # Autodetectting the uid needed for the share
                         attrs = self.nfs3.getattr(file_handle, auth=self.auth)
                         self.auth["uid"] = attrs["attributes"]["uid"]
+                        record["uid"] = self.auth["uid"]
 
                         read_perm, write_perm, exec_perm = self.get_permissions(file_handle)
-                        self.mount.umnt(self.auth)
+                        record["permissions"] = {"read": read_perm, "write": write_perm, "execute": exec_perm}
+                        if self.last_permission_error:
+                            raise RuntimeError(self.last_permission_error)
                         self.db.add_share(self.host, (read_perm, write_perm, exec_perm), (convert_size(used_space), "/", convert_size(total_space)), share, network)
                         self.logger.highlight(f"{self.auth['uid']:<11}{'r' if read_perm else '-'}{'w' if write_perm else '-'}{('x' if exec_perm else '-'):<7}{convert_size(used_space) + '/' + convert_size(total_space):<16} {share:<30} {', '.join(network) if network else 'No network':<15}")
                 except Exception as e:
+                    record["error"] = str(e) or type(e).__name__
+                    errors.append(f"{share}: {record['error']}")
                     self.logger.fail(f"Failed to list share: {share} - {e}")
+                finally:
+                    if mounted:
+                        try:
+                            self.mount.umnt(self.auth)
+                        except Exception as e:
+                            errors.append(f"Unmounting {share}: {e}")
 
         except Exception as e:
+            errors.append(str(e) or type(e).__name__)
             self.logger.fail(f"Error on Enumeration NFS Shares: {self.host}:{self.port} {e}")
         finally:
-            self.nfs3.disconnect()
+            try:
+                if client is not None:
+                    client.disconnect()
+            except Exception as e:
+                errors.append(f"Disconnecting NFS client: {e}")
+            finally:
+                self.auth.clear()
+                self.auth.update(original_auth)
+                self.nfs3 = original_client
+        if self.playbook_mode:
+            return ActionResult("nfs", "shares", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE, NFSSharesData(deepcopy(records)), error="; ".join(errors) if errors else None)
 
     def get_permissions(self, file_handle):
-        """Check permissions for the file handle"""
-        try:
-            read_perm = self.nfs3.access(file_handle, ACCESS3_READ, self.auth).get("resok", {}).get("access", 0) is ACCESS3_READ
-        except Exception:
-            read_perm = False
-        try:
-            write_perm = self.nfs3.access(file_handle, ACCESS3_MODIFY, self.auth).get("resok", {}).get("access", 0) is ACCESS3_MODIFY
-        except Exception:
-            write_perm = False
-        try:
-            exec_perm = self.nfs3.access(file_handle, ACCESS3_EXECUTE, self.auth).get("resok", {}).get("access", 0) is ACCESS3_EXECUTE
-        except Exception:
-            exec_perm = False
-        return read_perm, write_perm, exec_perm
+        """Check access masks without treating query failures as denied access."""
+        permissions = []
+        errors = []
+        for mask in (ACCESS3_READ, ACCESS3_MODIFY, ACCESS3_EXECUTE):
+            try:
+                response = self.nfs3.access(file_handle, mask, self.auth)
+                if response.get("status", 0) != 0:
+                    raise RuntimeError(f"NFS access status {response['status']}")
+                permissions.append(bool(response["resok"]["access"] & mask))
+            except Exception as e:
+                permissions.append(None if self.playbook_mode else False)
+                errors.append(str(e) or type(e).__name__)
+        self.last_permission_error = "; ".join(errors) if errors else None
+        if self.playbook_mode and hasattr(self, "listing_errors"):
+            self.listing_errors.extend(errors)
+        return tuple(permissions)
 
     def enum_shares(self):
+        records = []
+        self.listing_errors = []
+        errors = self.listing_errors
+        original_auth = self.auth.copy()
+        original_client = getattr(self, "nfs3", None)
+        client = None
         try:
             nfs_port = self.portmap.getport(NFS_PROGRAM, NFS_V3)
             self.nfs3 = NFSv3(self.host, nfs_port, self.args.nfs_timeout, self.auth)
+            client = self.nfs3
             self.nfs3.connect()
 
             # Mounting NFS Shares
-            output_export = str(self.mount.export())
-            reg = re.compile(r"ex_dir=b'([^']*)'")
-            shares = list(reg.findall(output_export))
-            networks = self.export_info(self.mount.export())
+            exports = self.export_records(self.mount.export())
 
             self.logger.display("Enumerating NFS Shares Directories")
-            for share, network in zip(shares, networks, strict=True):
+            for share, network in exports:
+                record = {"path": share, "networks": network, "mount_status": None, "entries": [], "error": None}
+                records.append(record)
+                mounted = False
+                self.auth.update(original_auth)
                 try:
                     mount_info = self.mount.mnt(share, self.auth)
+                    record["mount_status"] = mount_info["status"]
                     self.logger.debug(f"Mounted {share} - {mount_info}")
                     if mount_info["status"] != 0:
+                        record["error"] = f"Mount status {mount_info['status']}"
+                        errors.append(f"{share}: {record['error']}")
                         self.logger.fail(f"Error mounting share {share}: {NFSSTAT3[mount_info['status']]}")
                         continue
 
+                    mounted = True
                     fhandle = mount_info["mountinfo"]["fhandle"]
-                    contents = self.list_dir(fhandle, share, self.args.enum_shares)
+                    contents = self.list_dir(fhandle, share, self.args.enum_shares if self.args.enum_shares is not None else 3)
+                    record["entries"] = contents
 
                     self.logger.success(share)
                     if contents:
@@ -330,6 +399,8 @@ class nfs(connection):
                     for content in contents:
                         self.logger.highlight(f"{content['uid']:<11}{'r' if content['read'] else '-'}{'w' if content['write'] else '-'}{'x' if content['execute'] else '-':<7}{content['filesize']:<14} {content['path']:<45} {', '.join(network) if network else 'No network':<15}")
                 except Exception as e:
+                    record["error"] = str(e) or type(e).__name__
+                    errors.append(f"{share}: {record['error']}")
                     if "RPC_AUTH_ERROR: AUTH_REJECTEDCRED" in str(e):
                         self.logger.fail(f"{share} - RPC Access denied")
                     elif "RPC_AUTH_ERROR: AUTH_TOOWEAK" in str(e):
@@ -338,11 +409,28 @@ class nfs(connection):
                         self.logger.fail(f"{share} - Insufficient Permissions for share listing")
                     else:
                         self.logger.exception(f"{share} - {e}")
+                finally:
+                    if mounted:
+                        try:
+                            self.mount.umnt(self.auth)
+                        except Exception as e:
+                            errors.append(f"Unmounting {share}: {e}")
         except Exception as e:
+            errors.append(str(e) or type(e).__name__)
             self.logger.debug(f"Error on Listing NFS Shares Directories: {self.host}:{self.port} {e}")
             self.logger.debug("It is probably unknown format or can not access as anonymously.")
         finally:
-            self.nfs3.disconnect()
+            try:
+                if client is not None:
+                    client.disconnect()
+            except Exception as e:
+                errors.append(f"Disconnecting NFS client: {e}")
+            finally:
+                self.auth.clear()
+                self.auth.update(original_auth)
+                self.nfs3 = original_client
+        if self.playbook_mode:
+            return ActionResult("nfs", "enum_shares", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE, NFSSharesData(deepcopy(records)), error="; ".join(errors) if errors else None)
 
     def get_file(self):
         """Downloads a file from the NFS share"""
@@ -666,9 +754,7 @@ class nfs(connection):
         if not self.nfs3:
             raise Exception("NFS connection is not established")
 
-        output_export = str(self.mount.export())
-        reg = re.compile(r"ex_dir=b'([^']*)'")  # Get share names
-        shares = list(reg.findall(output_export))
+        shares = [path for path, _ in self.export_records(self.mount.export())]
 
         self.logger.debug(f"Trying root escape on shares: {shares}")
         for share in shares:

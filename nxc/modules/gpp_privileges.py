@@ -1,4 +1,7 @@
-import re
+from dataclasses import dataclass
+
+from ldap3.utils.conv import escape_filter_chars
+from nxc.playbooks.results import ActionResult, ResultStatus
 from io import BytesIO
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldapasn1 as ldapasn1_impacket
@@ -94,55 +97,80 @@ class NXCModule:
         "S-1-5-32-580": "BUILTIN\\Remote Management Users",
     }
 
+    @dataclass
+    class ResultData:
+        policies: list[dict]
+        ldap_resolution_requested: bool
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """NO_LDAP      If set to True, disables LDAP queries for resolving SIDs."""
-        self.no_ldap = module_options.get("NO_LDAP", False)
+        self.no_ldap = str(module_options.get("NO_LDAP", "false")).lower() in ("true", "1")
 
     def on_login(self, context, connection):
         self.context = context
+        self.errors = []
+        policies = []
+        paths = []
         try:
             connection.conn.listPath("SYSVOL", "*")
+            paths = connection.spider("SYSVOL", pattern=["GptTmpl.inf"])
         except Exception as e:
-            self.context.log.fail(f"Failed to list shares: {e}")
-            return
-
-        self.context.log.display("Searching for GptTmpl.inf files")
-        paths = connection.spider("SYSVOL", pattern=["GptTmpl.inf"])
-
-        if not paths:
-            self.context.log.warning("No GptTmpl.inf files found in SYSVOL.")
-            return
-
+            self.errors.append(str(e) or type(e).__name__)
         for path in paths:
-            if "6AC1786C-016F-11D2-945F-00C04fB984F9" in path:  # Default Domain Policy
-                self.context.log.success(f"Found Default Domain Policy GptTmpl.inf: {path}")
-            else:
-                self.context.log.info(f"Found GptTmpl.inf: {path}")
-
-            buf = BytesIO()
-            connection.conn.getFile("SYSVOL", path, buf.write)
-
+            policy = {"path": path, "privileges": [], "error": None}
+            policies.append(policy)
             try:
-                content = buf.getvalue().decode("utf-16le")
-            except UnicodeDecodeError as e:
-                self.context.log.error(f"Failed to decode {path} as UTF-16LE: {e}")
-                continue
-
-            privileges = self.extract_privileges(content)
-            if privileges:
-                ldap_connection = None
-                base_dn = None
-                if not self.no_ldap:
+                with BytesIO() as buffer:
+                    connection.conn.getFile("SYSVOL", path, buffer.write)
+                    content = buffer.getvalue().decode("utf-16le").lstrip("\ufeff")
+                policy["privileges"] = [{"privilege": privilege, "principals": [{"sid": sid, "name": None} for sid in sids]} for privilege, sids in self.extract_privileges(content).items()]
+            except Exception as e:
+                policy["error"] = str(e) or type(e).__name__
+                self.errors.append(f"{path}: {policy['error']}")
+        ldap_connection = None
+        base_dn = None
+        self.ldap_session = None
+        unresolved = any(principal["sid"] not in self.WELL_KNOWN_SIDS for policy in policies for privilege in policy["privileges"] for principal in privilege["principals"])
+        try:
+            if not self.no_ldap and unresolved:
+                playbook = getattr(context, "playbook", None)
+                if playbook is not None:
+                    credential = getattr(context, "credential", None)
+                    source = getattr(context, "session", None)
+                    anonymous = source is not None and getattr(source.result.data, "anonymous", False)
+                    if credential is None and not anonymous:
+                        self.errors.append("LDAP SID resolution requires a stored credential reference or an anonymous source session")
+                    else:
+                        session = playbook.ldap(credential=credential, anonymous=anonymous, stop_on_error=False)
+                        if session.ok:
+                            self.ldap_session = session
+                        else:
+                            self.errors.append(session.result.error or "LDAP resolution session could not authenticate")
+                else:
                     ldap_connection = self.initialize_ldap_connection(connection)
-                    base_dn = self.get_basedn(ldap_connection)
-
-                self.context.log.success(f"Privileges extracted from {path}:")
-                for privilege, sids in privileges.items():
-                    resolved_sids = [self.resolve_sid(sid, ldap_connection, base_dn) for sid in sids]
-                    self.context.log.highlight(f"{privilege}: {', '.join(resolved_sids)}")
-
-                if ldap_connection:
+                    if ldap_connection:
+                        base_dn = self.get_basedn(ldap_connection)
+            for policy in policies:
+                for privilege in policy["privileges"]:
+                    for principal in privilege["principals"]:
+                        principal["name"] = self.resolve_sid(principal["sid"], ldap_connection, base_dn)
+                    context.log.highlight(f"{policy['path']} {privilege['privilege']}: {privilege['principals']}")
+        finally:
+            if ldap_connection:
+                try:
                     ldap_connection.close()
+                except Exception as e:
+                    self.errors.append(f"Closing LDAP resolution connection: {e}")
+        for error in self.errors:
+            context.log.fail(error)
+        found = any(policy["privileges"] for policy in policies)
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if self.errors else ResultStatus.SUCCESS if found else ResultStatus.NEGATIVE,
+            self.ResultData(policies, not self.no_ldap), error="; ".join(self.errors) or None,
+        )
 
     def get_basedn(self, ldap_connection):
         root = ldap_connection.search(
@@ -153,29 +181,23 @@ class NXCModule:
         return parse_result_attributes(root)[0]["defaultNamingContext"]
 
     def extract_privileges(self, content):
-        """Parses the content of GptTmpl.inf to extract privilege rights."""
+        """Read only the Privilege Rights section, preserving empty assignments."""
         privileges = {}
-        in_priv_section = False
-
-        for line in content.splitlines():
-            if line.strip() == "[Privilege Rights]":
-                in_priv_section = True
+        active = False
+        for line in content.lstrip("\ufeff").splitlines():
+            line = line.strip()
+            if not line or line.startswith(";"):
                 continue
-            if in_priv_section and line.strip() == "":
-                break
-            if in_priv_section:
-                match = re.match(r"^(.*?)\s*=\s*(.*)$", line)
-                if match:
-                    privilege, sids = match.groups()
-                    privileges[privilege] = [sid.strip("*") for sid in sids.split(",")]
-
+            if line.startswith("[") and line.endswith("]"):
+                active = line.casefold() == "[privilege rights]"
+                continue
+            if active and "=" in line:
+                privilege, values = line.split("=", 1)
+                privileges[privilege.strip()] = [value.strip().lstrip("*") for value in values.split(",") if value.strip()]
         return privileges
 
     def initialize_ldap_connection(self, connection):
-        """
-        Initializes an LDAP connection using impacket with LDAPS first, then falls back to plaintext LDAP if LDAPS fails.
-        Attempts to retrieve the base DN from the Root DSE or derive it from the domain name.
-        """
+        """Initialize LDAP resolution using the SMB session credentials."""
         ldap_connection = None
         try:
             ldap_connection = ldap_impacket.LDAPConnection(url=f"ldap://{connection.remoteName}", dstIp=connection.host)
@@ -200,35 +222,28 @@ class NXCModule:
                 )
             self.context.log.success("Connected to LDAP.")
         except Exception as e:
-            self.context.log.fail(f"LDAP connection failed: {e}")
+            self.errors.append(f"LDAP connection failed: {e}")
+            if ldap_connection is not None:
+                try:
+                    ldap_connection.close()
+                except Exception as e:
+                    self.errors.append(f"Closing failed LDAP connection: {e}")
             return None
         return ldap_connection
 
     def resolve_sid(self, sid, ldap_connection, base_dn):
-        """Resolves a SID to a human-readable name using well-known mappings or LDAP queries."""
         if sid in self.WELL_KNOWN_SIDS:
             return self.WELL_KNOWN_SIDS[sid]
-
-        if ldap_connection:
-            try:
-                resp = ldap_connection.search(
-                    searchBase=base_dn,
-                    searchFilter=f"(objectSid={sid})",
-                    attributes=["sAMAccountName"],
-                )
-                parsed_result = parse_result_attributes(resp)
-                if parsed_result and "sAMAccountName" in parsed_result[0]:
-                    return f"{parsed_result[0]['sAMAccountName']}"
-                else:
-                    self.context.log.warning(f"SID {sid} not found in LDAP. Returning raw SID.")
-
-            except ldap_impacket.LDAPSearchError:
-                self.context.log.warning(f"SID {sid} not found in LDAP. Returning raw SID.")
-            except ldap_impacket.LDAPFilterSyntaxError:
-                self.context.log.warning(f"Invalid LDAP filter syntax for SID {sid}. Returning raw SID.")
-            except Exception as e:
-                self.context.log.error(f"Failed while resolving SID {sid} via LDAP: {e}")
-        else:
-            self.context.log.warning(f"LDAP connection not established. Returning raw SID: {sid}")
-
-        return sid
+        if self.ldap_session is not None:
+            result = self.ldap_session.query(query=[f"(objectSid={escape_filter_chars(sid)})", "sAMAccountName"], stop_on_error=False)
+            if result.error:
+                self.errors.append(f"Resolving {sid}: {result.error}")
+            records = getattr(result.data, "entries", [])
+            if records:
+                return records[0].get("sAMAccountName")
+        elif ldap_connection:
+            response = ldap_connection.search(searchBase=base_dn, searchFilter=f"(objectSid={escape_filter_chars(sid)})", attributes=["sAMAccountName"])
+            records = parse_result_attributes(response)
+            if records:
+                return records[0].get("sAMAccountName")
+        return None

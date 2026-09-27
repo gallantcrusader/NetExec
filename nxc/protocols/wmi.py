@@ -1,7 +1,11 @@
+from dataclasses import dataclass, replace
+from copy import deepcopy
+
 import os
 from io import StringIO
 
 from nxc.helpers.negotiate_parser import parse_challenge
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.config import process_secret
 from nxc.connection import connection, dcom_FirewallChecker, requires_admin
 from nxc.logger import NXCAdapter
@@ -22,8 +26,15 @@ from impacket.dcerpc.v5.dcom.wmi import CLSID_WbemLevel1Login, IID_IWbemLevel1Lo
 MSRPC_UUID_PORTMAP = uuidtup_to_bin(("E1AF8308-5D1F-11C9-91A4-08002B14A0FA", "3.0"))
 
 
+@dataclass
+class WMIQueryData:
+    query: str
+    namespace: str
+    records: list[dict]
+
+
 class wmi(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.domain = ""
         self.targetDomain = ""
         self.hash = ""
@@ -55,7 +66,7 @@ class wmi(connection):
 
         self._dpapi_triage = None
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -66,6 +77,14 @@ class wmi(connection):
                 "hostname": self.hostname
             }
         )
+
+    def close_session(self):
+        try:
+            if self.iWbemLevel1Login is not None:
+                self.iWbemLevel1Login.RemRelease()
+                self.iWbemLevel1Login = None
+        finally:
+            super().close_session()
 
     # Redefine disconnect function.
     def disconnect(self):
@@ -180,8 +199,11 @@ class wmi(connection):
             else:
                 try:
                     self.iWbemLevel1Login = IWbemLevel1Login(iInterface)
-                    _ = self.iWbemLevel1Login.NTLMLogin("//./root/cimv2", NULL, NULL)
-                    self.iWbemLevel1Login.RemRelease()
+                    services = self.iWbemLevel1Login.NTLMLogin("//./root/cimv2", NULL, NULL)
+                    if self.playbook_mode:
+                        services.RemRelease()
+                    else:
+                        self.iWbemLevel1Login.RemRelease()
                 except Exception as e:
                     if "access_denied" not in str(e).lower():
                         self.logger.fail(str(e))
@@ -266,6 +288,14 @@ class wmi(connection):
             else:
                 self.doKerberos = True
                 self.check_if_admin()
+                if self.username:
+                    if ntlm_hash:
+                        self.hash = ntlm_hash
+                        self.db.add_credential("hash", domain, self.username, ntlm_hash)
+                    elif password:
+                        self.db.add_credential("plaintext", domain, self.username, password)
+                    elif aesKey:
+                        self.db.add_credential("aesKey", domain, self.username, aesKey)
                 out = f"{self.domain}\\{self.username}{used_ccache} {self.mark_pwned()}"
                 self.logger.success(out)
                 dce.disconnect()
@@ -314,11 +344,15 @@ class wmi(connection):
                 out = f"{domain}\\{self.username}:{process_secret(self.password)} {self.mark_pwned()}"
                 if self.username == "" and self.password == "":
                     out += "(Default allow anonymous login)"
+                elif self.username:
+                    self.db.add_credential("plaintext", domain, self.username, self.password)
                 self.logger.success(out)
                 return True
 
     def hash_login(self, domain, username, ntlm_hash):
         self.username = username
+        self.domain = domain
+        self.hash = ntlm_hash
         lmhash = ""
         nthash = ""
         if ntlm_hash.find(":") != -1:
@@ -369,11 +403,67 @@ class wmi(connection):
                 out = f"{domain}\\{self.username}:{process_secret(self.nthash)} {self.mark_pwned()}"
                 if self.username == "" and self.password == "":
                     out += "(Default allow anonymous login)"
+                elif self.username:
+                    self.db.add_credential("hash", domain, self.username, ntlm_hash)
                 self.logger.success(out)
                 return True
 
+    def query_result(self, query=None, namespace=None, callback_func=None, auth_level=None):
+        query = query if query is not None else self.args.wmi_query.strip("\n")
+        namespace = namespace or self.args.wmi_namespace
+        records = []
+        resources = []
+        errors = []
+        try:
+            services = self.iWbemLevel1Login.NTLMLogin(namespace, NULL, NULL)
+            resources.append(services)
+            if auth_level is not None:
+                services.get_dce_rpc().set_auth_level(auth_level)
+            enumerator = services.ExecQuery(query)
+            resources.append(enumerator)
+            if callback_func:
+                callback_func(enumerator, records)
+            else:
+                while True:
+                    try:
+                        objects = enumerator.Next(0xFFFFFFFF, 1)
+                    except Exception as e:
+                        if "S_FALSE" in str(e):
+                            break
+                        raise
+                    if not objects:
+                        break
+                    for obj in objects:
+                        try:
+                            record = deepcopy(obj.getProperties())
+                            records.append(record)
+                            for name, value in record.items():
+                                self.logger.highlight(f"{name} => {value['value']}")
+                        finally:
+                            obj.RemRelease()
+        except Exception as e:
+            if not (callback_func and "S_FALSE" in str(e)):
+                errors.append(str(e) or type(e).__name__)
+        finally:
+            for resource in reversed(resources):
+                try:
+                    resource.RemRelease()
+                except Exception as e:
+                    errors.append(f"Releasing WMI query resource: {e}")
+        self.last_wmi_error = "; ".join(errors) or None
+        if errors:
+            self.logger.fail(self.last_wmi_error)
+        return ActionResult("wmi", "wmi_query", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE, WMIQueryData(query, namespace, records), error="; ".join(errors) if errors else None)
+
     @requires_admin
     def wmi_query(self, wql=None, namespace=None, callback_func=None):
+        self.last_wmi_error = None
+        if self.playbook_mode:
+            if wql is None and namespace is None and callback_func is None:
+                return self.query_result()
+            if callback_func is not None:
+                return self.query_result(wql, namespace, callback_func).data.records
+            return self.query_result(wql, namespace).data.records
         records = []
         if not wql:
             wql = self.args.wmi_query.strip("\n")
@@ -383,10 +473,12 @@ class wmi(connection):
 
         try:
             iWbemServices = self.iWbemLevel1Login.NTLMLogin(namespace, NULL, NULL)
-            self.iWbemLevel1Login.RemRelease()
+            if not self.playbook_mode:
+                self.iWbemLevel1Login.RemRelease()
             iEnumWbemClassObject = iWbemServices.ExecQuery(wql)
         except Exception as e:
             self.logger.debug(str(e))
+            self.last_wmi_error = str(e) or type(e).__name__
             self.logger.fail(f"Execute WQL error: {e}")
             return False
         else:
@@ -403,29 +495,21 @@ class wmi(connection):
                     callback_func(iEnumWbemClassObject, records)
             except Exception as e:
                 if str(e).find("S_FALSE") < 0:
+                    self.last_wmi_error = str(e) or type(e).__name__
                     self.logger.debug(e)
             return records
 
+    @requires_admin
     def list_snapshots(self):
-        drive = self.args.list_snapshots
-        self.logger.info(f"Retrieving volume shadow copies of drive {drive}.")
-        wql = "select ID, DeviceObject, ClientAccessible, InstallDate from win32_shadowcopy"
-
-        def callback_func(iEnumWbemClassObject, records):
-            while True:
-                wmi_results = iEnumWbemClassObject.Next(0xFFFFFFFF, 1)[0]
-                record = dict(wmi_results.getProperties())
-                records.append(record)
-
-        snapshots = self.wmi_query(wql=wql, namespace="root\\cimv2", callback_func=callback_func)
+        query = "select ID, DeviceObject, ClientAccessible, InstallDate, VolumeName from win32_shadowcopy"
+        self.logger.info("Retrieving volume shadow copies across all volumes via WMI.")
+        if self.playbook_mode:
+            result = self.query_result(query, "root\\cimv2")
+            return replace(result, action="list_snapshots", inputs={"list_snapshots": self.args.list_snapshots})
+        snapshots = self.wmi_query(wql=query, namespace="root\\cimv2")
         if not snapshots:
             self.logger.info("No volume shadow copies found.")
-            return
-
-        self.logger.highlight(f"{'Drive':<8}{'Shadow Copy ID':<40}{'ClientAccessible':<18}{'InstallDate':<27}{'Device Object':<50}")
-        self.logger.highlight(f"{'------':<8}{'--------------':<40}{'----------------':<18}{'-----------':<27}{'-------------':<50}")
-        for record in snapshots:
-            self.logger.highlight(f"{drive:<8}{record['ID']['value']:<40}{record['ClientAccessible']['value']:<18}{record['InstallDate']['value']:<27}{record['DeviceObject']['value']:<50}")
+        return None
 
     @requires_admin
     def execute(self, command=None, get_output=False, use_powershell=False):

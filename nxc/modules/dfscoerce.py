@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from nxc.helpers.misc import CATEGORY
 
 
@@ -6,6 +7,7 @@ class NXCModule:
     description = "[REMOVED] Module to check if the DC is vulnerable to DFSCoerce, credit to @filip_dragovic/@Wh04m1001 and @topotam"
     supported_protocols = ["smb"]
     category = CATEGORY.PRIVILEGE_ESCALATION
+    result_type = RetiredModuleData
 
     def __init__(self, context=None, module_options=None):
         self.context = context
@@ -20,3 +22,4 @@ class NXCModule:
 
     def on_login(self, context, connection):
         context.log.fail('[REMOVED] This module moved to the new module "coerce_plus"')
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("module:coerce_plus"), error='[REMOVED] This module moved to the new module "coerce_plus"')

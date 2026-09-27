@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.helpers.misc import CATEGORY
 from nxc.parsers.ldap_results import parse_result_attributes
 
@@ -11,6 +14,12 @@ class NXCModule:
     description = "Get the info field of all users. May contain password"
     supported_protocols = ["ldap"]
     category = CATEGORY.CREDENTIAL_DUMPING
+
+    @dataclass
+    class ResultData:
+        users: list[dict]
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """FILTER    Apply the FILTER (grep-like) (default: '')"""
@@ -34,6 +43,13 @@ class NXCModule:
             context.log.success("Found following users: ")
             for answer in answers:
                 context.log.highlight(f"User: {answer[0]:<20} Info: {answer[1]}")
+
+        error = connection.last_search_error
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS if answers else ResultStatus.NEGATIVE,
+            self.ResultData([{"username": username, "info": info} for username, info in answers]), error=error,
+        )
 
     def filter_answer(self, context, answers):
         # No option to filter

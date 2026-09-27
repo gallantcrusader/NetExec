@@ -1,8 +1,11 @@
+from dataclasses import dataclass
+from sys import exit
+
+from ldap3.utils.conv import escape_filter_chars
+
 from nxc.helpers.misc import CATEGORY
-from nxc.logger import nxc_logger
-from impacket.ldap.ldap import LDAPSearchError
-from impacket.ldap.ldapasn1 import SearchResultEntry
-import sys
+from nxc.parsers.ldap_results import parse_result_attributes
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -18,6 +21,13 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        text: str
+        computers: list[dict]
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """
         TEXT    Search TEXT in the operating system or name of the computer.
@@ -32,49 +42,31 @@ class NXCModule:
             self.TEXT = module_options["TEXT"]
         else:
             context.log.error("TEXT option is required!")
-            sys.exit(1)
+            exit(1)
 
     def on_login(self, context, connection):
-        search_filter = f"(&(objectCategory=computer)(|(operatingSystem=*{self.TEXT}*)(name=*{self.TEXT}*)))"
-
-        try:
-            context.log.debug(f"Search Filter={search_filter}")
-            resp = connection.ldap_connection.search(searchFilter=search_filter, attributes=["dNSHostName", "operatingSystem"], sizeLimit=0)
-        except LDAPSearchError as e:
-            if e.getErrorString().find("sizeLimitExceeded") >= 0:
-                context.log.debug("sizeLimitExceeded exception caught, giving up and processing the data received")
-                resp = e.getAnswers()
-            else:
-                nxc_logger.debug(e)
-                return False
-
-        answers = []
-        context.log.debug(f"Total no. of records returned: {len(resp)}")
-        for item in resp:
-            if isinstance(item, SearchResultEntry) is not True:
+        text = escape_filter_chars(self.TEXT)
+        search_filter = f"(&(objectCategory=computer)(|(operatingSystem=*{text}*)(name=*{text}*)))"
+        context.log.debug(f"Search Filter={search_filter}")
+        response = connection.search(searchFilter=search_filter, attributes=["dNSHostName", "operatingSystem"])
+        errors = [connection.last_search_error] if connection.last_search_error else []
+        computers = []
+        for item in parse_result_attributes(response):
+            hostname = item.get("dNSHostName")
+            if not hostname:
                 continue
-            dns_host_name = ""
-            operating_system = ""
-            try:
-                for attribute in item["attributes"]:
-                    if str(attribute["type"]) == "dNSHostName":
-                        dns_host_name = str(attribute["vals"][0])
-                    elif str(attribute["type"]) == "operatingSystem":
-                        operating_system = attribute["vals"][0]
-                if dns_host_name != "" and operating_system != "":
-                    answers.append([dns_host_name, operating_system])
-            except Exception as e:
-                context.log.debug("Exception:", exc_info=True)
-                context.log.debug(f"Skipping item, cannot process due to error {e}")
-        if len(answers) > 0:
-            context.log.success("Found the following computers: ")
-            for answer in answers:
-                resolv = connection.resolver(answer[0])
-                if resolv:
-                    context.log.highlight(f"{answer[0]} ({answer[1]}) ({resolv['host']})")
-                    context.log.debug("IP found via DNS query")
-                else:
-                    context.log.debug(f"No DNS response for {answer[0]}")
-                    context.log.highlight(f"{answer[0]} ({answer[1]}) (No IP Found)")
-        else:
+            resolution = connection.resolver(hostname)
+            address = resolution.get("host") if resolution else None
+            computer = {"dns_hostname": hostname, "operating_system": item.get("operatingSystem"), "address": address, "resolution_error": None}
+            if address is None:
+                computer["resolution_error"] = f"No address resolved for {hostname}"
+                errors.append(computer["resolution_error"])
+            computers.append(computer)
+            context.log.highlight(f"{hostname} ({item.get('operatingSystem', 'Unknown OS')}) ({address or 'No IP Found'})")
+        if not computers:
             context.log.success(f"Unable to find any computers with the text {self.TEXT}")
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if computers else ResultStatus.NEGATIVE,
+            self.ResultData(self.TEXT, computers), error="; ".join(errors) or None,
+        )

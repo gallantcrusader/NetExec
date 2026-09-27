@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.helpers.misc import CATEGORY
 from nxc.parsers.ldap_results import parse_result_attributes
 
@@ -23,14 +26,22 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        quota: int | None
+
+    result_type = ResultData
+
     def on_login(self, context, connection):
         context.log.display("Getting the MachineAccountQuota")
 
         ldap_response = connection.search("(ms-DS-MachineAccountQuota=*)", ["ms-DS-MachineAccountQuota"])
         entries = parse_result_attributes(ldap_response)
 
+        error = connection.last_search_error
         if not entries:
             context.log.fail("No LDAP entries returned.")
-            return
+            return ActionResult("ldap", self.name, connection.host, ResultStatus.FAILED if error else ResultStatus.NEGATIVE, self.ResultData(None), error=error)
 
         context.log.highlight(f"MachineAccountQuota: {entries[0]['ms-DS-MachineAccountQuota']}")
+        return ActionResult("ldap", self.name, connection.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, self.ResultData(int(entries[0]["ms-DS-MachineAccountQuota"])), error=error)

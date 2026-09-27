@@ -9,5 +9,6 @@ def proto_args(parser, parents):
     cgroup.add_argument("--ls", metavar="DIRECTORY", nargs="?", const=".", help="List all files (including hidden) in the directory")
     cgroup.add_argument("--cat", metavar="FILE", help="Display the contents of a file. Example: --cat /path/to/file")
     cgroup.add_argument("--get", metavar="FILE", help="Download a file")
+    cgroup.add_argument("--get-output", metavar="PATH", help="Local download path (default: under NXC_PATH/downloads/ftp)")
     cgroup.add_argument("--put", metavar=("LOCAL_FILE", "REMOTE_FILE"), nargs=2, help="Upload a file")
     return parser

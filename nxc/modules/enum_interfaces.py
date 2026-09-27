@@ -1,95 +1,104 @@
-#!/usr/bin/env python3
+from dataclasses import dataclass
 
-import contextlib
 from impacket.examples.secretsdump import RemoteOperations
 from impacket.dcerpc.v5 import rrp
-from impacket.dcerpc.v5.rpcrt import DCERPCException
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import RegistryValue
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
-    """
-    Retrieve the list of network interfaces info (Name, IP Address, Subnet Mask, Default Gateway) from remote Windows registry'
-    Formerly --interfaces parameter
-    Made by: @Sant0rryu, @NeffIsBack
-    """
+    """Registry network interface inventory, originally by Sant0rryu and NeffIsBack."""
 
     name = "enum_interfaces"
-    description = "Retrieve the list of network interfaces info (Name, IP Address, Subnet Mask, Default Gateway) from remote Windows registry (formerly --interfaces)"
+    description = "Retrieve network interface settings from remote Windows registry (formerly --interfaces)"
     supported_protocols = ["smb"]
     opsec_safe = False
     category = CATEGORY.ENUMERATION
 
-    def __init__(self):
-        self.context = None
-        self.module_options = {}
+    @dataclass
+    class ResultData:
+        interfaces: list[dict]
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """No options available"""
 
-    def on_admin_login(self, context, connection):
-        """Execute network interface enumeration on authenticated SMB connection"""
-        self.context = context
-
+    def read_value(self, rpc, handle, name):
+        value = RegistryValue()
         try:
-            remoteOps = RemoteOperations(connection.conn, False)
-            remoteOps.enableRegistry()
+            value.registry_type, value.value = rrp.hBaseRegQueryValue(rpc, handle, name)
+            value.present = True
+        except rrp.DCERPCSessionError as e:
+            if e.get_error_code() != 2:
+                value.error = str(e) or type(e).__name__
+        except Exception as e:
+            value.error = str(e) or type(e).__name__
+        return value
 
-            if remoteOps._RemoteOperations__rrp:
-                reg_handle = rrp.hOpenLocalMachine(remoteOps._RemoteOperations__rrp)["phKey"]
-                key_handle = rrp.hBaseRegOpenKey(remoteOps._RemoteOperations__rrp, reg_handle, "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces")["phkResult"]
-                sub_key_list = rrp.hBaseRegQueryInfoKey(remoteOps._RemoteOperations__rrp, key_handle)["lpcSubKeys"]
-                sub_keys = [rrp.hBaseRegEnumKey(remoteOps._RemoteOperations__rrp, key_handle, i)["lpNameOut"][:-1] for i in range(sub_key_list)]
-
-                context.log.highlight(f"{'-Name-':<11} | {'-IP Address-':<15} | {'-SubnetMask-':<15} | {'-Gateway-':<15} | -DHCP-")
-                for sub_key in sub_keys:
-                    interface = {}
+    def on_admin_login(self, context, connection):
+        interfaces = []
+        errors = []
+        handles = []
+        remote_ops = None
+        try:
+            remote_ops = RemoteOperations(connection.conn, False)
+            remote_ops.enableRegistry()
+            rpc = remote_ops._RemoteOperations__rrp
+            root = rrp.hOpenLocalMachine(rpc)["phKey"]
+            handles.append(root)
+            base = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+            key = rrp.hBaseRegOpenKey(rpc, root, base)["phkResult"]
+            handles.append(key)
+            count = rrp.hBaseRegQueryInfoKey(rpc, key)["lpcSubKeys"]
+            for index in range(count):
+                identifier = rrp.hBaseRegEnumKey(rpc, key, index)["lpNameOut"].rstrip("\x00")
+                interface = {"id": identifier, "values": {}, "name": RegistryValue(), "error": None}
+                interfaces.append(interface)
+                try:
+                    handle = rrp.hBaseRegOpenKey(rpc, root, base + "\\" + identifier)["phkResult"]
+                    handles.append(handle)
+                    for name in ("EnableDHCP", "IPAddress", "SubnetMask", "DefaultGateway", "DhcpIPAddress", "DhcpSubnetMask", "DhcpDefaultGateway"):
+                        value = self.read_value(rpc, handle, name)
+                        interface["values"][name] = value
+                        if value.error:
+                            errors.append(f"{identifier} {name}: {value.error}")
+                    name_key = rf"SYSTEM\CurrentControlSet\Control\Network\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\{identifier}\Connection"
                     try:
-                        interface_key = f"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\{sub_key}"
-                        interface_handle = rrp.hBaseRegOpenKey(remoteOps._RemoteOperations__rrp, reg_handle, interface_key)["phkResult"]
-
-                        # Retrieve Interace Name
-                        interface_name_key = f"SYSTEM\\ControlSet001\\Control\\Network\\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\\{sub_key}\\Connection"
-                        interface_name_handle = rrp.hBaseRegOpenKey(remoteOps._RemoteOperations__rrp, reg_handle, interface_name_key)["phkResult"]
-                        interface_name = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, interface_name_handle, "Name")[1].rstrip("\x00")
-                        interface["Name"] = str(interface_name)
-                        if "Kernel" in interface_name:
-                            continue
-
-                        # Retrieve DHCP
-                        try:
-                            dhcp_enabled = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, interface_handle, "EnableDHCP")[1]
-                        except DCERPCException:
-                            dhcp_enabled = False
-                        interface["DHCP"] = bool(dhcp_enabled)
-
-                        # Retrieve IPAddress
-                        try:
-                            ip_address = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, interface_handle, "DhcpIPAddress" if dhcp_enabled else "IPAddress")[1].rstrip("\x00").replace("\x00", ", ")
-                        except DCERPCException:
-                            ip_address = None
-                        interface["IPAddress"] = ip_address if ip_address else None
-
-                        # Retrieve SubnetMask
-                        try:
-                            subnetmask = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, interface_handle, "SubnetMask")[1].rstrip("\x00").replace("\x00", ", ")
-                        except DCERPCException:
-                            subnetmask = None
-                        interface["SubnetMask"] = subnetmask if subnetmask else None
-
-                        # Retrieve DefaultGateway
-                        try:
-                            default_gateway = rrp.hBaseRegQueryValue(remoteOps._RemoteOperations__rrp, interface_handle, "DhcpDefaultGateway")[1].rstrip("\x00").replace("\x00", ", ")
-                        except DCERPCException:
-                            default_gateway = None
-                        interface["DefaultGateway"] = default_gateway if default_gateway else None
-
-                        context.log.highlight(f"{interface['Name']:<11} | {interface['IPAddress']!s:<15} | {interface['SubnetMask']!s:<15} | {interface['DefaultGateway']!s:<15} | {interface['DHCP']}")
-
-                    except DCERPCException as e:
-                        context.log.info(f"Failed to retrieve the network interface info for {sub_key}: {e!s}")
-
-            with contextlib.suppress(Exception):
-                remoteOps.finish()
-        except DCERPCException as e:
-            context.log.error(f"Failed to connect to the target: {e!s}")
+                        name_handle = rrp.hBaseRegOpenKey(rpc, root, name_key)["phkResult"]
+                        handles.append(name_handle)
+                        interface["name"] = self.read_value(rpc, name_handle, "Name")
+                    except rrp.DCERPCSessionError as e:
+                        if e.get_error_code() != 2:
+                            raise
+                    if interface["name"].error:
+                        errors.append(f"{identifier} Name: {interface['name'].error}")
+                    context.log.highlight(f"{identifier}: {interface['name'].value}")
+                    for name, value in interface["values"].items():
+                        if value.present:
+                            context.log.highlight(f"  {name}: {value.value}")
+                except Exception as e:
+                    interface["error"] = str(e) or type(e).__name__
+                    errors.append(f"{identifier}: {interface['error']}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        finally:
+            for handle in reversed(handles):
+                try:
+                    rrp.hBaseRegCloseKey(rpc, handle)
+                except Exception as e:
+                    errors.append(f"Closing registry handle: {e}")
+            if remote_ops is not None:
+                try:
+                    remote_ops.finish()
+                except Exception as e:
+                    errors.append(f"Finishing registry operation: {e}")
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if interfaces else ResultStatus.NEGATIVE,
+            self.ResultData(interfaces), error="; ".join(errors) or None,
+        )

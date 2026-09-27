@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from impacket.dcerpc.v5 import transport, rrp
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE
 from impacket.smbconnection import SessionError
@@ -15,6 +16,7 @@ class NXCModule:
     opsec_safe = True
     multiple_hosts = True
     category = CATEGORY.ENUMERATION
+    result_type = RetiredModuleData
 
     # Reference table from MSRC report
     # https://msrc.microsoft.com/update-guide/fr-FRS/vulnerability/CVE-2025-33073
@@ -48,7 +50,7 @@ class NXCModule:
 
     def on_login(self, context, connection):
         context.log.fail("[REMOVED] This module has been integrated into the enum_cve module.")
-        return
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("module:enum_cve"), error="[REMOVED] This module has been integrated into the enum_cve module.")
         self.context = context
         self.connection = connection
         connection.trigger_winreg()
@@ -70,7 +72,7 @@ class NXCModule:
             dce.disconnect()
             if not version_str:
                 self.context.log.info("Could not determine OS version from registry")
-                return
+                return None
             vuln = self.is_vulnerable(connection.server_os_major, connection.server_os_minor, connection.server_os_build, ubr)
             if vuln:
                 if not connection.conn.isSigningRequired():  # Not vulnerable if SMB signing is enabled

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Boolean, UniqueConstraint, Integer, PrimaryKeyConstraint, String, select
+from sqlalchemy import Column, Boolean, UniqueConstraint, Integer, PrimaryKeyConstraint, String, insert, select
 from sqlalchemy.dialects.sqlite import Insert
 from sqlalchemy.orm import declarative_base
 
@@ -11,7 +11,9 @@ BaseTable = declarative_base()
 class database(BaseDB):
     def __init__(self, db_engine):
         self.HostsTable = None
+        self.CredentialsTable = None
 
+        self.db_schema(db_engine)
         super().__init__(db_engine)
 
     class Host(BaseTable):
@@ -29,12 +31,48 @@ class database(BaseDB):
             UniqueConstraint("ip"),
         )
 
+    class Credential(BaseTable):
+        __tablename__ = "credentials"
+        id = Column(Integer)
+        domain = Column(String)
+        username = Column(String)
+        password = Column(String)
+        credtype = Column(String)
+
+        __table_args__ = (
+            PrimaryKeyConstraint("id"),
+        )
+
     @staticmethod
     def db_schema(db_conn):
         BaseTable.metadata.create_all(db_conn)
 
     def reflect_tables(self):
         self.HostsTable = self.reflect_table(self.Host)
+        self.CredentialsTable = self.reflect_table(self.Credential)
+
+    def add_credential(self, credtype, domain, username, password):
+        """Store a successful RDP login once and return its ID."""
+        q = select(self.CredentialsTable).filter(
+            self.CredentialsTable.c.credtype == credtype,
+            self.CredentialsTable.c.domain == domain,
+            self.CredentialsTable.c.username == username,
+            self.CredentialsTable.c.password == password,
+        )
+        row = self.db_execute(q).first()
+        if row is not None:
+            return row.id
+        result = self.db_execute(insert(self.CredentialsTable).values(credtype=credtype, domain=domain, username=username, password=password))
+        return result.inserted_primary_key[0]
+
+    def get_credentials(self, filter_term=None):
+        """Return credentials by ID, username, or all rows."""
+        q = select(self.CredentialsTable)
+        if isinstance(filter_term, int):
+            q = q.filter(self.CredentialsTable.c.id == filter_term)
+        elif filter_term:
+            q = q.filter(self.CredentialsTable.c.username == filter_term)
+        return self.db_execute(q).all()
 
     def add_host(self, ip, port, hostname, domain, os, nla):
         """

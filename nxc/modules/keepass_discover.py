@@ -1,4 +1,8 @@
-from csv import reader
+from dataclasses import dataclass
+from sys import exit
+import json
+
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.helpers.misc import CATEGORY
 
 
@@ -15,57 +19,71 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        processes: list[dict]
+        files: list[str]
+        processes_queried: bool
+        files_queried: bool
+        outputs: dict
+
+    result_type = ResultData
+
     def __init__(self):
         self.search_type = "ALL"
-        self.search_path = "'C:\\Users\\','$env:PROGRAMFILES','env:ProgramFiles(x86)'"
+        self.search_path = "'C:\\Users\\',$env:ProgramFiles,${env:ProgramFiles(x86)}"
 
     def options(self, context, module_options):
         r"""
         SEARCH_TYPE     Specify what to search, between:
-                          PROCESS     Look for running KeePass.exe process only
+                          PROCESS     Look for process names beginning with kee
                           FILES       Look for KeePass-related files (KeePass.config.xml, .kdbx, KeePass.exe) only, may take some time
-                          ALL         Look for running KeePass.exe process and KeePass-related files (default)
+                          ALL         Look for process names beginning with kee and KeePass-related files (default)
 
         SEARCH_PATH     Comma-separated remote locations where to search for KeePass-related files (you must add single quotes around the paths if they include spaces)
-                        Default: 'C:\\Users\\','$env:PROGRAMFILES','env:ProgramFiles(x86)'
+                        Default: 'C:\\Users\\',$env:ProgramFiles,${env:ProgramFiles(x86)}
         """
         if "SEARCH_PATH" in module_options:
             self.search_path = module_options["SEARCH_PATH"]
 
         if "SEARCH_TYPE" in module_options:
-            self.search_type = module_options["SEARCH_TYPE"]
+            self.search_type = module_options["SEARCH_TYPE"].upper()
+        if self.search_type not in ("ALL", "PROCESS", "FILES"):
+            context.log.fail("SEARCH_TYPE must be ALL, PROCESS, or FILES")
+            exit(1)
 
     def on_admin_login(self, context, connection):
-        if self.search_type == "ALL" or self.search_type == "PROCESS":
-            # search for keepass process
-            search_keepass_process_command_str = 'powershell.exe "Get-Process kee* -IncludeUserName | Select-Object -Property Id,UserName,ProcessName | ConvertTo-CSV -NoTypeInformation"'
-            search_keepass_process_output_csv = connection.execute(search_keepass_process_command_str, True)  # we return the powershell command as a CSV for easier column parsing
-            csv_reader = reader(search_keepass_process_output_csv.split("\n"), delimiter=",")
-            next(csv_reader)  # to skip the csv header line
-            row_number = 0  # as csv_reader is an iterator we can't get its length without exhausting it
-            for row in csv_reader:
-                row_number += 1
-                keepass_process_id = row[0]
-                keepass_process_username = row[1]
-                keepass_process_name = row[2]
-                context.log.highlight(f'Found process "{keepass_process_name}" with PID {keepass_process_id} (user {keepass_process_username})')
-            if row_number == 0:
-                context.log.display("No KeePass-related process was found")
-
-        # search for keepass-related files
-        if self.search_type == "ALL" or self.search_type == "FILES":
-            search_keepass_files_payload = f"Get-ChildItem -Path {self.search_path} -Recurse -Force -Include ('KeePass.config.xml','KeePass.exe','*.kdbx') -ErrorAction SilentlyContinue | Select FullName -ExpandProperty FullName"
-            search_keepass_files_cmd = f'powershell.exe "{search_keepass_files_payload}"'
-            search_keepass_files_output = connection.execute(search_keepass_files_cmd, True).split("\r\n")
-            found = False
-            found_xml = False
-            for file in search_keepass_files_output:
-                if "KeePass" in file or "kdbx" in file:
-                    if "xml" in file:
-                        found_xml = True
-                    found = True
-                    context.log.highlight(f"Found {file}")
-            if not found:
-                context.log.display("No KeePass-related file were found")
-            elif not found_xml:
-                context.log.fail("No config settings file found !!!")
+        data = self.ResultData([], [], False, False, {})
+        errors = []
+        searches = {}
+        if self.search_type in ("ALL", "PROCESS"):
+            searches["processes"] = "Get-Process -IncludeUserName -ErrorAction SilentlyContinue -ErrorVariable +lookupErrors | Where-Object { $_.ProcessName -like 'kee*' } | Select-Object Id,UserName,ProcessName"
+        if self.search_type in ("ALL", "FILES"):
+            searches["files"] = f"Get-ChildItem -Path {self.search_path} -Recurse -Force -Include ('KeePass.config.xml','KeePass.exe','*.kdbx') -ErrorAction SilentlyContinue -ErrorVariable +lookupErrors | Where-Object {{ -not $_.PSIsContainer }} | Select-Object -ExpandProperty FullName"
+        for kind, search in searches.items():
+            setattr(data, f"{kind}_queried", True)
+            payload = "$lookupErrors = @(); $records = @(" + search + "); @{records=$records; errors=@($lookupErrors | ForEach-Object { $_.ToString() })} | ConvertTo-Json -Compress -Depth 5"
+            try:
+                output = connection.execute(f'powershell.exe -NoProfile -Command "{payload}"', True)
+                data.outputs[kind] = output
+                parsed = json.loads(output)
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("records"), list) or not isinstance(parsed.get("errors"), list):
+                    raise ValueError("Discovery command returned an invalid result envelope")
+                records = parsed["records"]
+                if kind == "files" and any(not isinstance(record, str) for record in records):
+                    raise ValueError("File discovery returned a non-path record")
+                if kind == "processes" and any(not isinstance(record, dict) or not {"Id", "UserName", "ProcessName"} <= record.keys() for record in records):
+                    raise ValueError("Process discovery returned an invalid record")
+                setattr(data, kind, records)
+                errors.extend(f"{kind}: {error}" for error in parsed["errors"])
+                for record in records:
+                    context.log.highlight(f"Found {kind}: {record}")
+            except Exception as e:
+                errors.append(f"{kind}: {str(e) or type(e).__name__}")
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if data.processes or data.files else ResultStatus.NEGATIVE,
+            data, error="; ".join(errors) or None,
+        )

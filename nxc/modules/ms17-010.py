@@ -3,10 +3,12 @@
 # Module by @mpgn_x64
 
 from ctypes import c_uint8, c_uint16, c_uint32, c_uint64, Structure
+from dataclasses import dataclass
 import socket
 import struct
 from nxc.helpers.misc import CATEGORY
 from nxc.logger import nxc_logger
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class SmbHeader(Structure):
@@ -57,20 +59,37 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        vulnerable: bool | None
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """ """
         self.logger = context.log
 
     def on_login(self, context, connection):
         try:
-            if self.check(connection.host):
+            vulnerable = self.check(connection.host)
+            if vulnerable:
                 context.log.highlight("VULNERABLE")
                 context.log.highlight("Next step: https://www.rapid7.com/db/modules/exploit/windows/smb/ms17_010_eternalblue/")
+            return ActionResult(
+                connection.args.protocol,
+                self.name,
+                connection.host,
+                ResultStatus.FAILED if vulnerable is None else ResultStatus.SUCCESS if vulnerable else ResultStatus.NEGATIVE,
+                self.ResultData(vulnerable),
+                error="Unable to determine MS17-010 status" if vulnerable is None else None,
+            )
         except ConnectionResetError as e:
             context.log.debug(f"Error connecting to host when checking for MS17-010: {e!s}")
+            return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, self.ResultData(False), error=str(e))
         except ValueError as e:
             if str(e) == "Buffer size too small (0 instead of at least 32 bytes)":
                 context.log.debug("Buffer size too small, which means the response was not the expected size")
+            return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, self.ResultData(False), error=str(e))
 
     def generate_smb_proto_payload(self, *protos):
         """
@@ -485,10 +504,14 @@ class NXCModule:
 
             if smb.multiplex_id == 0x0051:
                 key = self.calculate_doublepulsar_xor_key(smb.signature)
-                self.logger.highlight(f"Host is likely INFECTED with DoublePulsar! - XOR Key: {key.decode()}")
+                self.logger.highlight(f"Host is likely INFECTED with DoublePulsar! - XOR Key: {key:08x}")
+            result = True
         elif nt_status in (b"\x08\x00\x00\xc0", b"\x22\x00\x00\xc0"):
             self.logger.fail(f"{ip} does NOT appear vulnerable")
+            result = False
         else:
             self.logger.fail(f"{ip} Unable to detect if this host is vulnerable")
+            result = None
 
         client.close()
+        return result

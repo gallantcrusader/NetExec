@@ -1,0 +1,197 @@
+{
+  "source": "ad/GOAD/data/config.json",
+  "source_sha256": "af8ac0390eab55476ae3dcd5264b698c9f4e1e74b9ac8dea26e2da2f2e88b442",
+  "domains": {
+    "sevenkingdoms.local": {
+      "dc": "10.60.0.10",
+      "acls": [
+        {
+          "name": "forcechangepassword_tywin_jaime",
+          "for": "tywin.lannister",
+          "to": "jaime.lannister",
+          "right": "Ext-User-Force-Change-Password",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericWrite_on_user_jaimie_joffrey",
+          "for": "jaime.lannister",
+          "to": "joffrey.baratheon",
+          "right": "GenericWrite",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "Writedacl_joffrey_tyron",
+          "for": "joffrey.baratheon",
+          "to": "tyron.lannister",
+          "right": "WriteDacl",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "self-self-membership-on-group_tyron_small_council",
+          "for": "tyron.lannister",
+          "to": "Small Council",
+          "right": "Ext-Self-Self-Membership",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "addmember_smallcouncil_DragonStone",
+          "for": "Small Council",
+          "to": "DragonStone",
+          "right": "Ext-Write-Self-Membership",
+          "inheritance": "All",
+          "principal_kind": "group"
+        },
+        {
+          "name": "write_owner_dragonstone_kingsguard",
+          "for": "DragonStone",
+          "to": "KingsGuard",
+          "right": "WriteOwner",
+          "inheritance": "None",
+          "principal_kind": "group"
+        },
+        {
+          "name": "GenericAll_kingsguard_stanis",
+          "for": "KingsGuard",
+          "to": "stannis.baratheon",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "group"
+        },
+        {
+          "name": "GenericAll_stanis_dc",
+          "for": "stannis.baratheon",
+          "to": "kingslanding$",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericAll_group_acrrosdom_dc",
+          "for": "AcrossTheNarrowSea",
+          "to": "kingslanding$",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "group"
+        },
+        {
+          "name": "GenericAll_varys_domadmin",
+          "for": "lord.varys",
+          "to": "Domain Admins",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericAll_varys_domadmin_holder",
+          "for": "lord.varys",
+          "to": "CN=AdminSDHolder,CN=System,DC=sevenkingdoms,DC=local",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "WriteDACL_renly_Crownlands",
+          "for": "renly.baratheon",
+          "to": "OU=Crownlands,DC=sevenkingdoms,DC=local",
+          "right": "WriteDacl",
+          "inheritance": "None",
+          "principal_kind": "user"
+        }
+      ]
+    },
+    "north.sevenkingdoms.local": {
+      "dc": "10.60.0.11",
+      "acls": [
+        {
+          "name": "anonymous_rpc",
+          "for": "NT AUTHORITY\\ANONYMOUS LOGON",
+          "to": "DC=North,DC=sevenkingdoms,DC=local",
+          "right": "ReadProperty",
+          "inheritance": "All",
+          "principal_kind": "well_known"
+        },
+        {
+          "name": "anonymous_rpc2",
+          "for": "NT AUTHORITY\\ANONYMOUS LOGON",
+          "to": "DC=North,DC=sevenkingdoms,DC=local",
+          "right": "GenericExecute",
+          "inheritance": "All",
+          "principal_kind": "well_known"
+        }
+      ]
+    },
+    "essos.local": {
+      "dc": "10.60.0.12",
+      "acls": [
+        {
+          "name": "GenericAll_khal_viserys",
+          "for": "khal.drogo",
+          "to": "viserys.targaryen",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericAll_spy_jorah",
+          "for": "Spys",
+          "to": "jorah.mormont",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "group"
+        },
+        {
+          "name": "GenericAll_khal_esc4",
+          "for": "khal.drogo",
+          "to": "CN=ESC4,CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=essos,DC=local",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "WriteProperty_petyer_domadmin",
+          "for": "viserys.targaryen",
+          "to": "jorah.mormont",
+          "right": "WriteProperty",
+          "inheritance": "All",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericWrite_DragonsFriends_braavos",
+          "for": "DragonsFriends",
+          "to": "braavos$",
+          "right": "GenericWrite",
+          "inheritance": "None",
+          "principal_kind": "group"
+        },
+        {
+          "name": "GenericAll_missandei_khal",
+          "for": "missandei",
+          "to": "khal.drogo",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "user"
+        },
+        {
+          "name": "GenericAll_gmsaDragon_drogo",
+          "for": "gmsaDragon$",
+          "to": "drogon",
+          "right": "GenericAll",
+          "inheritance": "None",
+          "principal_kind": "gmsa"
+        },
+        {
+          "name": "GenericWrite_missandei_viserys",
+          "for": "missandei",
+          "to": "viserys.targaryen",
+          "right": "GenericWrite",
+          "inheritance": "None",
+          "principal_kind": "user"
+        }
+      ]
+    }
+  }
+}

@@ -2,19 +2,29 @@ import nxc
 import importlib
 import traceback
 import sys
+from dataclasses import is_dataclass
+from hashlib import sha256
+from threading import Lock
+from pathlib import Path
 
 from os import listdir
-from os.path import basename, dirname
+from os.path import dirname
 from os.path import join as path_join
 
 from nxc.context import Context
 from nxc.helpers.misc import CATEGORY
 from nxc.logger import NXCAdapter
 from nxc.paths import NXC_PATH
+from nxc.playbooks.contracts import ResultContractError
+from nxc.playbooks.capture import RecordingLogger
 
 
 class ModuleOptionsError(Exception):
-    """Raised when a module aborts the run from options() (returned False)."""
+    """Preserve option-stage output when a module cannot be configured."""
+
+    def __init__(self, message, events=()):
+        super().__init__(message)
+        self.events = list(events)
 
 
 class ModuleLoader:
@@ -51,6 +61,7 @@ class ModuleLoader:
         return not module_error
 
     module_cache = {}
+    module_cache_lock = Lock()
 
     @classmethod
     def load_module_file(cls, module_path):
@@ -61,18 +72,20 @@ class ModuleLoader:
         multiple modules. Results are cached so each file is only parsed
         and executed once regardless of how many targets are scanned.
         """
-        if module_path not in cls.module_cache:
-            module_name = f"nxc_module_{basename(module_path)[:-3]}"
-            spec = importlib.util.spec_from_file_location(module_name, module_path)
-            module = importlib.util.module_from_spec(spec)
-            # Register before executing. Modules that define their own impacket
-            # NDRCALL requests rely on impacket resolving the matching Response
-            # class via sys.modules[request.__module__] (rpcrt.py), which the
-            # previous load_module() satisfied implicitly.
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            cls.module_cache[module_path] = module
-        return cls.module_cache[module_path]
+        with cls.module_cache_lock:
+            if module_path not in cls.module_cache:
+                module_name = f"nxc_module_{sha256(module_path.encode()).hexdigest()[:16]}"
+                spec = importlib.util.spec_from_file_location(module_name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                # Impacket looks up custom request classes through sys.modules.
+                sys.modules[module_name] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    del sys.modules[module_name]
+                    raise
+                cls.module_cache[module_path] = module
+            return cls.module_cache[module_path]
 
     def load_module(self, module_path):
         """Load a module, initializing it and checking that it has the proper attributes"""
@@ -90,6 +103,11 @@ class ModuleLoader:
         module = self.load_module(module_path)
 
         if module:
+            if getattr(self.args, "playbook_mode", False):
+                result_type = getattr(module, "result_type", None)
+                builtin = Path(module_path).resolve().parent == (Path(nxc.__file__).resolve().parent / "modules")
+                if (not builtin or result_type is not None) and (not isinstance(result_type, type) or not is_dataclass(result_type)):
+                    raise ResultContractError(f"Module {module.name} must declare a dataclass result_type before it can run in a playbook; use nxc/modules/example_module.py as a template")
             self.logger.debug(f"Supported protocols: {module.supported_protocols}")
             self.logger.debug(f"Protocol: {self.args.protocol}")
             if self.args.protocol in module.supported_protocols:
@@ -98,14 +116,24 @@ class ModuleLoader:
                 except Exception as e:
                     self.logger.fail(f"Error loading NXCAdaptor for module {module.name.upper()}: {e}")
                 context = Context(self.db, module_logger, self.args)
+                if getattr(self.args, "playbook_mode", False):
+                    context.log = RecordingLogger(module_logger)
                 module_options = {}
 
                 for option in self.args.module_options:
                     key, value = option.split("=", 1)
                     module_options[str(key).upper()] = value
 
-                if module.options(context, module_options) is False:
-                    raise ModuleOptionsError(f"Module {module.name} aborted the run from options()")
+                try:
+                    option_result = module.options(context, module_options)
+                except (Exception, SystemExit) as e:
+                    if getattr(self.args, "playbook_mode", False):
+                        raise ModuleOptionsError(f"Module {module.name} options failed: {e}", context.log.events) from e
+                    raise
+                if option_result is False:
+                    raise ModuleOptionsError(f"Module {module.name} aborted the run from options()", getattr(context.log, "events", ()))
+                if getattr(self.args, "playbook_mode", False):
+                    module.option_events = context.log.events
                 return module
             else:
                 self.logger.fail(f"Module {module.name.upper()} is not supported for protocol {self.args.protocol}")

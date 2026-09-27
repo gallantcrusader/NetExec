@@ -5,14 +5,17 @@ import hmac
 import json
 import os
 import socket
+from ldap3.utils.conv import escape_filter_chars
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from errno import EHOSTUNREACH, ETIMEDOUT, ENETUNREACH
 from binascii import hexlify
 from datetime import datetime
+from pathlib import Path
 from re import sub, IGNORECASE
 from zipfile import ZipFile
 from termcolor import colored
 from dns import resolver
-from dateutil.relativedelta import relativedelta as rd
 
 from OpenSSL.SSL import SysCallError
 from bloodhound.ad.authentication import ADAuthentication
@@ -34,7 +37,7 @@ from impacket.krb5.types import Principal, KerberosException
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldaptypes
 from impacket.ldap import ldapasn1 as ldapasn1_impacket
-from impacket.ldap.ldap import LDAPFilterSyntaxError, MODIFY_REPLACE
+from impacket.ldap.ldap import MODIFY_REPLACE
 from impacket.smbconnection import SessionError
 from impacket.ntlm import getNTLMSSPType1
 
@@ -49,6 +52,7 @@ from nxc.protocols.ldap.kerberos import KerberosAttacks
 from nxc.parsers.ldap_results import parse_result_attributes
 from nxc.helpers.negotiate_parser import parse_challenge
 from nxc.paths import CONFIG_PATH
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
 ldap_error_status = {
     "1": "STATUS_NOT_SUPPORTED",
@@ -66,13 +70,106 @@ ldap_error_status = {
 }
 
 
+@dataclass
+class DirectoryUser:
+    username: str
+    description: str
+    bad_password_count: str
+    password_last_set: str
+
+
+@dataclass
+class LDAPUsersData:
+    domain: str
+    search_filter: str
+    users: list[DirectoryUser]
+
+
+@dataclass
+class LDAPActiveUsersData:
+    domain: str
+    search_filter: str
+    users: list[dict]
+    disabled_count: int
+    unknown_status_count: int
+
+
+@dataclass
+class LDAPQueryData:
+    search_filter: str
+    attributes: list[str] | None
+    entries: list[dict]
+    distinguished_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LDAPGroupsData:
+    requested_group: str | None
+    groups: list[dict]
+    members: list[dict]
+
+
+@dataclass
+class LDAPComputersData:
+    computers: list[str]
+
+
+@dataclass
+class LDAPOUsData:
+    requested_ou: str | None
+    ous: list[dict]
+    users: list[dict]
+    search_base: str | None
+
+
+@dataclass
+class LDAPAccountSearchData:
+    domain: str
+    search_filter: str
+    accounts: list[dict]
+
+
+@dataclass
+class LDAPDCListData:
+    controllers: list[dict]
+    trusts: list[dict]
+
+
+@dataclass
+class LDAPPSOData:
+    policies: list[dict]
+    assignments: list[dict]
+
+
+@dataclass
+class LDAPPasswordPolicyData:
+    domain: str
+    min_password_length: str
+    password_history_length: str
+    maximum_password_age: str
+    minimum_password_age: str
+    password_complexity_flags: str
+    lockout_reset_time: str
+    lockout_duration: str
+    lockout_threshold: str
+    forced_logoff_time: str
+
+
+@dataclass
+class BloodhoundData:
+    collection_methods: list[str]
+    excluded_methods: list[str]
+    archive: Path | None
+
+
 class ldap(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.domain = None
         self.server_os = None
         self.os_arch = 0
         self.hash = None
         self.ldap_connection = None
+        self.last_search_error = None
         self.lmhash = ""
         self.nthash = ""
         self.baseDN = ""
@@ -90,7 +187,7 @@ class ldap(connection):
         self.scope = None
         self.configuration_context = ""
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -357,6 +454,8 @@ class ldap(connection):
             elif ntlm_hash:
                 self.logger.debug(f"Adding credential: {domain}/{self.username}:{self.hash}")
                 self.db.add_credential("hash", domain, self.username, self.hash)
+            elif aesKey:
+                self.db.add_credential("aesKey", domain, self.username, aesKey)
 
             used_ccache = " from ccache" if useCache else f":{process_secret(kerb_pass)}"
             self.logger.success(f"{domain}\\{self.username}{used_ccache} {self.mark_pwned()}")
@@ -416,6 +515,8 @@ class ldap(connection):
                     elif ntlm_hash:
                         self.logger.debug(f"Adding credential: {domain}/{self.username}:{self.hash}")
                         self.db.add_credential("hash", domain, self.username, self.hash)
+                    elif aesKey:
+                        self.db.add_credential("aesKey", domain, self.username, aesKey)
 
                     # Prepare success credential text
                     self.logger.success(f"{domain}\\{self.username} {self.mark_pwned()}")
@@ -673,6 +774,7 @@ class ldap(connection):
         return t
 
     def search(self, searchFilter, attributes, sizeLimit=0, baseDN=None, searchControls=None) -> list:
+        self.last_search_error = None
         if baseDN is None and self.args.base_dn is not None:
             baseDN = self.args.base_dn
         elif baseDN is None:
@@ -696,14 +798,18 @@ class ldap(connection):
             if "sizeLimitExceeded" in str(e):
                 # We should never reach this code as we use paged search now
                 self.logger.fail("sizeLimitExceeded exception caught, giving up and processing the data received")
-                e.getAnswers()
+                self.last_search_error = str(e) or type(e).__name__
+                return e.getAnswers()
             # if empty username and password is possible that we need to change the scope, we try with a baseObject before returning a fail
             elif "operationsError" in str(e) and self.scope is None and self.username == "" and self.password == "":
                 self.scope = ldapasn1_impacket.Scope("baseObject")
                 return self.search(searchFilter, attributes, sizeLimit, baseDN)
             else:
                 self.logger.fail(e)
+                self.last_search_error = str(e) or type(e).__name__
                 return []
+        if not self.ldap_connection:
+            self.last_search_error = "LDAP connection unavailable"
         return []
 
     def users(self):
@@ -720,7 +826,7 @@ class ldap(connection):
         """
         if self.args.users:
             self.logger.debug(f"Dumping users: {', '.join(self.args.users)}")
-            search_filter = f"(|{''.join(f'(sAMAccountName={user})' for user in self.args.users)})"
+            search_filter = f"(|{''.join(f'(sAMAccountName={escape_filter_chars(user)})' for user in self.args.users)})"
         else:
             self.logger.debug("Trying to dump all users")
             search_filter = "(sAMAccountType=805306368)"
@@ -729,6 +835,7 @@ class ldap(connection):
         request_attributes = ["sAMAccountName", "description", "badPwdCount", "pwdLastSet"]
         resp = self.search(search_filter, request_attributes, sizeLimit=0)
         users = []
+        records = []
 
         if resp:
             resp_parsed = parse_result_attributes(resp)
@@ -744,27 +851,39 @@ class ldap(connection):
                 # We default attributes to blank strings if they don't exist in the dict
                 self.logger.highlight(f"{user.get('sAMAccountName', ''):<30}{pwd_last_set:<20}{user.get('badPwdCount', ''):<9}{user.get('description', ''):<60}")
                 users.append(user.get("sAMAccountName", ""))
+                records.append(DirectoryUser(user.get("sAMAccountName", ""), user.get("description", ""), str(user.get("badPwdCount", "")), str(pwd_last_set)))
             if self.args.users_export:
                 self.logger.display(f"Writing {len(resp_parsed):d} local users to {self.args.users_export}")
                 with open(self.args.users_export, "w+") as file:
                     file.writelines(f"{user}\n" for user in users)
 
+        if self.playbook_mode:
+            artifacts = [Artifact(Path(self.args.users_export), "user_list")] if self.args.users_export and resp else []
+            return ActionResult("ldap", "users", self.host, ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE, LDAPUsersData(self.domain, search_filter, records), artifacts, error=self.last_search_error)
+
     def users_export(self):
-        self.users()
+        result = self.users()
+        return replace(result, action="users_export") if self.playbook_mode else None
 
     def groups(self):
+        errors = []
+        groups = []
+        members = []
         # Group specific member search
         if self.args.groups:
             self.logger.debug(f"Dumping group: {self.args.groups}")
 
             # Resolve group DN and primaryGroupID (objectSid) and member attribute
-            group_resp = self.search(f"(&(cn={self.args.groups})(objectClass=group))", ["distinguishedName", "objectSid", "member"])
+            group_resp = self.search(f"(&(cn={escape_filter_chars(self.args.groups)})(objectClass=group))", ["distinguishedName", "objectSid", "member"])
+            if self.last_search_error:
+                errors.append(self.last_search_error)
             group_parsed = parse_result_attributes(group_resp)
 
             if not group_parsed:
                 self.logger.fail(f"Group '{self.args.groups}' not found")
-                return
+                return ActionResult("ldap", "groups", self.host, ResultStatus.FAILED if self.last_search_error else ResultStatus.NEGATIVE, LDAPGroupsData(self.args.groups, [], []), error=self.last_search_error) if self.playbook_mode else None
             else:
+                groups = deepcopy(group_parsed)
                 group = group_parsed[0]
                 direct_group_members = group.get("member", [])
                 if not isinstance(direct_group_members, list):
@@ -772,22 +891,34 @@ class ldap(connection):
 
             # Get all group members: user must have membership OR primaryGroupID
             search_filter = f"(|(memberOf={group['distinguishedName']})(primaryGroupID={group['objectSid'].split('-')[-1]}))"
-            attributes = ["sAMAccountName", "distinguishedName", "cn", "objectClass"]
+            attributes = ["sAMAccountName", "distinguishedName", "cn", "objectClass", "objectSid"]
             resp = self.search(search_filter, attributes)
+            if self.last_search_error:
+                errors.append(self.last_search_error)
             group_members = parse_result_attributes(resp)
             self.logger.debug(f"Total of records returned {len(group_members)}")
 
-            # Resolve any missing group members that the memberOf/primaryGroupID search above didn't already return
-            if len(group_members) < len(direct_group_members):
-                for member_dn in direct_group_members:
-                    member_resp = self.search(f"(distinguishedName={member_dn})", ["sAMAccountName", "distinguishedName", "cn", "objectClass"])
-                    member_parsed = parse_result_attributes(member_resp)
+            # Resolve each direct member not already returned, even when the
+            # primary-group search returned enough unrelated entries.
+            resolved_dns = {item["distinguishedName"].casefold() for item in group_members if isinstance(item.get("distinguishedName"), str)}
+            for member_dn in direct_group_members:
+                if member_dn.casefold() in resolved_dns:
+                    continue
+                previous_scope = self.scope
+                try:
+                    self.scope = ldapasn1_impacket.Scope("baseObject")
+                    member_resp = self.search("(objectClass=*)", attributes, baseDN=member_dn)
+                finally:
+                    self.scope = previous_scope
+                if self.last_search_error:
+                    errors.append(self.last_search_error)
+                member_parsed = parse_result_attributes(member_resp)
 
-                    if member_parsed:
-                        group_members.append(member_parsed[0])
-                    else:
-                        self.logger.debug(f"Failed to resolve group member DN '{member_dn}' for group '{self.args.groups}'")
-                        group_members.append({"distinguishedName": member_dn})
+                if member_parsed:
+                    group_members.append(member_parsed[0])
+                else:
+                    self.logger.debug(f"Failed to resolve group member DN '{member_dn}' for group '{self.args.groups}'")
+                    group_members.append({"distinguishedName": member_dn})
 
             # Deduplicate group members by distinguishedName or cn
             deduped = {}
@@ -795,6 +926,7 @@ class ldap(connection):
                 key = item.get("distinguishedName", item.get("cn", "")).lower()
                 deduped.setdefault(key, item)
             resp_parsed = list(deduped.values())
+            members = deepcopy(resp_parsed)
 
             # Display group members
             if not resp_parsed:
@@ -820,7 +952,10 @@ class ldap(connection):
             attributes = ["cn", "member", "description"]
 
             resp = self.search(search_filter, attributes)
+            if self.last_search_error:
+                errors.append(self.last_search_error)
             resp_parsed = parse_result_attributes(resp)
+            groups = deepcopy(resp_parsed)
             self.logger.debug(f"Total of records returned {len(resp_parsed)}")
 
             # Display all groups
@@ -835,7 +970,20 @@ class ldap(connection):
                     self.logger.debug("Exception:", exc_info=True)
                     self.logger.debug(f"Skipping item, cannot process due to error {e}")
 
+        if self.playbook_mode:
+            found = members if self.args.groups else groups
+            return ActionResult(
+                "ldap", "groups", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if found else ResultStatus.NEGATIVE,
+                LDAPGroupsData(self.args.groups or None, groups, members),
+                error="; ".join(errors) if errors else None, inputs={"groups": self.args.groups},
+            )
+
     def ous(self):
+        errors = []
+        ou_records = []
+        users = []
+        search_base = None
         if self.args.ous:
             # Find the OU's distinguished name first
             self.logger.debug(f"Dumping users from OU: {self.args.ous}")
@@ -844,10 +992,15 @@ class ldap(connection):
                 ["distinguishedName"],
             )
             ou_parsed = parse_result_attributes(ou_resp)
+            if self.last_search_error:
+                errors.append(self.last_search_error)
 
             if not ou_parsed:
                 self.logger.fail(f"OU '{self.args.ous}' not found")
-                return
+                return ActionResult("ldap", "ous", self.host, ResultStatus.FAILED if errors else ResultStatus.NEGATIVE, LDAPOUsData(self.args.ous, [], [], None), error=self.last_search_error) if self.playbook_mode else None
+
+            ou_records = deepcopy(ou_parsed)
+            search_base = ou_parsed[0]["distinguishedName"]
 
             self.logger.debug(f"Found OU DN: {ou_parsed[0]['distinguishedName']}")
 
@@ -858,20 +1011,25 @@ class ldap(connection):
                 baseDN=ou_parsed[0]["distinguishedName"],
             )
             resp_parsed = parse_result_attributes(resp)
+            if self.last_search_error:
+                errors.append(self.last_search_error)
+            users = deepcopy(resp_parsed)
             self.logger.debug(f"Total of records returned: {len(resp_parsed)}")
 
             if not resp_parsed:
                 self.logger.fail(f"OU '{self.args.ous}' has no users")
-                return
-
-            self.logger.highlight(f"{'-sAMAccountName-':<30} -cn-")
-            for user in resp_parsed:
-                self.logger.highlight(f"{user.get('sAMAccountName'):<30} {user.get('cn', '')}")
+            else:
+                self.logger.highlight(f"{'-sAMAccountName-':<30} -cn-")
+                for user in resp_parsed:
+                    self.logger.highlight(f"{user.get('sAMAccountName'):<30} {user.get('cn', '')}")
         else:
             # List all OUs
             self.logger.debug("Dumping all organizational units")
             resp = self.search("(objectCategory=organizationalUnit)", ["ou", "distinguishedName"])
             resp_parsed = parse_result_attributes(resp)
+            if self.last_search_error:
+                errors.append(self.last_search_error)
+            ou_records = deepcopy(resp_parsed)
             self.logger.debug(f"Total of records returned: {len(resp_parsed)}")
 
             self.logger.highlight(f"{'-OU-':<40} -Distinguished Name-")
@@ -881,6 +1039,15 @@ class ldap(connection):
                 except Exception as e:
                     self.logger.debug(f"Exception: {e}", exc_info=True)
 
+        if self.playbook_mode:
+            found = users if self.args.ous else ou_records
+            return ActionResult(
+                "ldap", "ous", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if found else ResultStatus.NEGATIVE,
+                LDAPOUsData(self.args.ous or None, ou_records, users, search_base),
+                error="; ".join(errors) if errors else None, inputs={"ous": self.args.ous},
+            )
+
     def computers(self):
         resp = self.search(f"(sAMAccountType={SAM_MACHINE_ACCOUNT})", ["sAMAccountName"])
         resp_parsed = parse_result_attributes(resp)
@@ -889,8 +1056,17 @@ class ldap(connection):
             self.logger.display(f"Total records returned: {len(resp_parsed)}")
             for item in resp_parsed:
                 self.logger.highlight(item["sAMAccountName"])
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "computers", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if resp_parsed else ResultStatus.NEGATIVE,
+                LDAPComputersData([item["sAMAccountName"] for item in resp_parsed]), error=self.last_search_error,
+            )
 
     def dc_list(self):
+        controllers = []
+        trusts = []
+        errors = []
         # bypass host resolver configuration via configure=False (default pulls from /etc/resolv.conf or registry on Windows)
         resolv = resolver.Resolver(configure=False)
         ns = self.args.dns_server or self.host
@@ -899,6 +1075,8 @@ class ldap(connection):
         resolv.timeout = self.args.dns_timeout
 
         def resolve_and_display_hostname(name, domain_name=None):
+            record = {"hostname": name, "domain": domain_name or self.domain, "record_type": None, "value": None}
+            controllers.append(record)
             prefix = f"[{domain_name}] " if domain_name else ""
             try:
                 # Resolve using DNS server for A, AAAA, CNAME, PTR, and NS records
@@ -906,6 +1084,7 @@ class ldap(connection):
                     try:
                         answers = resolv.resolve(name, record_type, tcp=self.args.dns_tcp)
                         for rdata in answers:
+                            record.update(record_type=record_type, value=rdata.to_text())
                             if record_type in ["A", "AAAA"]:
                                 ip_address = rdata.to_text()
                                 self.logger.highlight(f"{prefix}{name} = {colored(ip_address, host_info_colors[0])}")
@@ -932,11 +1111,16 @@ class ldap(connection):
             except Exception as e:
                 self.logger.fail(f"Skipping item(dNSHostName) {prefix}{name}, error: {e}")
 
+            if record["value"] is None:
+                errors.append(f"Unable to resolve domain controller {name}")
+
         # Find all domain controllers in the current domain
         self.logger.info("Enumerating Domain Controllers in current domain...")
         search_filter = "(&(objectCategory=computer)(primaryGroupId=516))"
         attributes = ["dNSHostName"]
         resp = self.search(search_filter, attributes)
+        if self.last_search_error:
+            errors.append(self.last_search_error)
         resp_parse = parse_result_attributes(resp)
         for item in resp_parse:
             if "dNSHostName" in item:  # Get dNSHostName attribute
@@ -948,7 +1132,10 @@ class ldap(connection):
         search_filter = "(objectClass=trustedDomain)"
         attributes = ["name", "trustDirection", "trustType", "trustAttributes", "flatName"]
         resp = self.search(search_filter, attributes, 0)
+        if self.last_search_error:
+            errors.append(self.last_search_error)
         trust_resp_parse = parse_result_attributes(resp)
+        trusts = deepcopy(trust_resp_parse)
 
         for trust in trust_resp_parse:
             try:
@@ -1000,6 +1187,8 @@ class ldap(connection):
 
             except Exception as e:
                 self.logger.fail(f"Failed {e} in trust entry: {trust}")
+                errors.append(f"Invalid trust entry: {e}")
+                continue
 
             # Only process if it's an Active Directory trust
             if int(trust_type) == 2:
@@ -1013,17 +1202,25 @@ class ldap(connection):
                         dc_hostname = str(srv.target).rstrip(".")
                         self.logger.success(f"Found DC in trusted domain: {colored(dc_hostname, host_info_colors[0], attrs=['bold'])}")
                         self.logger.highlight(f"{trust_name} -> {direction_text} -> {trust_attributes_text}")
-                        resolve_and_display_hostname(dc_hostname)
+                        resolve_and_display_hostname(dc_hostname, trust_name)
                 except Exception as e:
                     self.logger.fail(f"Failed to resolve DCs for {trust_name} via DNS: {e}")
+                    errors.append(f"Failed to resolve DCs for {trust_name} via DNS: {e}")
             else:
                 self.logger.display(f"Skipping non-Active Directory trust '{trust_name}' with type: {trust_type_text} and direction: {direction_text}")
         self.logger.info("Domain Controller enumeration complete.")
 
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "dc_list", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if controllers or trusts else ResultStatus.NEGATIVE,
+                LDAPDCListData(controllers, trusts), error="; ".join(errors) if errors else None,
+            )
+
     def active_users(self):
-        if len(self.args.active_users) > 0:
+        if self.args.active_users:
             self.logger.debug(f"Dumping users: {', '.join(self.args.active_users)}")
-            search_filter = f"(|{''.join(f'(sAMAccountName={user})' for user in self.args.active_users)})"
+            search_filter = f"(|{''.join(f'(sAMAccountName={escape_filter_chars(user)})' for user in self.args.active_users)})"
         else:
             self.logger.debug("Trying to dump all users")
             search_filter = "(sAMAccountType=805306368)"
@@ -1032,12 +1229,15 @@ class ldap(connection):
         request_attributes = ["sAMAccountName", "description", "badPwdCount", "pwdLastSet", "userAccountControl"]
         resp = self.search(search_filter, request_attributes, sizeLimit=0)
 
-        if resp:
-            all_users = parse_result_attributes(resp)
+        all_users = parse_result_attributes(resp)
+        active_users = []
+        disabled_count = sum(bool(int(user["userAccountControl"]) & UF_ACCOUNTDISABLE) for user in all_users if "userAccountControl" in user)
+        unknown_count = sum("userAccountControl" not in user for user in all_users)
+        if all_users:
             # Filter disabled users (ignore accounts without userAccountControl value)
             active_users = [user for user in all_users if not (int(user.get("userAccountControl", UF_ACCOUNTDISABLE)) & UF_ACCOUNTDISABLE)]
 
-            self.logger.display(f"Total records returned: {len(all_users)}, total {len(all_users) - len(active_users):d} user(s) disabled")
+            self.logger.display(f"Total records returned: {len(all_users)}, total {disabled_count:d} user(s) disabled, {unknown_count:d} unknown status")
             self.logger.highlight(f"{'-Username-':<30}{'-Last PW Set-':<20}{'-BadPW-':<9}{'-Description-':<60}")
 
             for user in active_users:
@@ -1045,6 +1245,13 @@ class ldap(connection):
                 if pwd_last_set:
                     pwd_last_set = "<never>" if pwd_last_set == "0" else datetime.fromtimestamp(self.getUnixTime(int(pwd_last_set))).strftime("%Y-%m-%d %H:%M:%S")
                 self.logger.highlight(f"{user.get('sAMAccountName', ''):<30}{pwd_last_set:<20}{user.get('badPwdCount', ''):<9}{user.get('description', '')}")
+
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "active_users", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if active_users else ResultStatus.NEGATIVE,
+                LDAPActiveUsersData(self.domain, search_filter, active_users, disabled_count, unknown_count), error=self.last_search_error,
+            )
 
     def asreproast(self):
         # Building the search filter
@@ -1216,31 +1423,30 @@ class ldap(connection):
             --query "(sAMAccountName=Administrator)" "sAMAccountName pwdLastSet memberOf"
         """
         search_filter = self.args.query[0]
-        attributes = [attr.strip() for attr in self.args.query[1].split(" ")]
-        if len(attributes) == 1 and attributes[0] == "":
-            attributes = None
+        attributes = self.args.query[1].split() or None
         if not search_filter:
             self.logger.fail("No filter specified")
-            return
+            return ActionResult("ldap", "query", self.host, ResultStatus.FAILED, LDAPQueryData(search_filter, attributes, []), error="No filter specified") if self.playbook_mode else None
         self.logger.debug(f"Querying LDAP server with filter: {search_filter} and attributes: {attributes}")
-        try:
-            resp = self.search(search_filter, attributes, 0)
-            resp_parsed = parse_result_attributes(resp)
-        except LDAPFilterSyntaxError as e:
-            self.logger.fail(f"LDAP Filter Syntax Error: {e}")
-            return
-        for idx, entry in enumerate(resp_parsed):
-            if not isinstance(resp[idx], ldapasn1_impacket.SearchResultEntry):
-                idx += 1  # Skip non-entry responses
-            self.logger.success(f"Response for object: {resp[idx]['objectName']}")
-            for attribute in entry:
-                if isinstance(entry[attribute], list) and entry[attribute]:
-                    # Display first item in the same line as attribute
-                    self.logger.highlight(f"{attribute:<20} {entry[attribute].pop(0)}")
-                    for item in entry[attribute]:
+        resp = self.search(search_filter, attributes, 0)
+        objects = [item for item in resp if isinstance(item, ldapasn1_impacket.SearchResultEntry)]
+        entries = parse_result_attributes(objects)
+        distinguished_names = [str(item["objectName"]) for item in objects]
+        for dn, entry in zip(distinguished_names, entries, strict=True):
+            self.logger.success(f"Response for object: {dn}")
+            for attribute, value in entry.items():
+                if isinstance(value, list) and value:
+                    self.logger.highlight(f"{attribute:<20} {value[0]}")
+                    for item in value[1:]:
                         self.logger.highlight(f"{'':<20} {item}")
                 else:
-                    self.logger.highlight(f"{attribute:<20} {entry[attribute]}")
+                    self.logger.highlight(f"{attribute:<20} {value}")
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "query", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if entries else ResultStatus.NEGATIVE,
+                LDAPQueryData(search_filter, attributes, entries, distinguished_names), error=self.last_search_error,
+            )
 
     def find_delegation(self):
         def printTable(items, header):
@@ -1355,6 +1561,13 @@ class ldap(connection):
         else:
             self.logger.fail("No entries found!")
 
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "trusted_for_delegation", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if resp_parsed else ResultStatus.NEGATIVE,
+                LDAPAccountSearchData(self.domain, searchFilter, resp_parsed), error=self.last_search_error,
+            )
+
     def password_not_required(self):
         # Building the search filter
         searchFilter = "(userAccountControl:1.2.840.113556.1.4.803:=32)"
@@ -1373,9 +1586,17 @@ class ldap(connection):
         else:
             self.logger.fail("No entries found!")
 
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "password_not_required", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if resp_parsed else ResultStatus.NEGATIVE,
+                LDAPAccountSearchData(self.domain, searchFilter, resp_parsed), error=self.last_search_error,
+            )
+
     def admin_count(self):
         # Building the search filter
-        resp = self.search(searchFilter="(&(adminCount=1)(objectClass=user))", attributes=["sAMAccountName"], sizeLimit=0)
+        searchFilter = "(&(adminCount=1)(objectClass=user))"
+        resp = self.search(searchFilter=searchFilter, attributes=["sAMAccountName"], sizeLimit=0)
         resp_parsed = parse_result_attributes(resp)
         self.logger.debug(f"Total of records returned {len(resp_parsed):d}")
 
@@ -1384,6 +1605,13 @@ class ldap(connection):
                 self.logger.highlight(user["sAMAccountName"])
         else:
             self.logger.fail("No entries found!")
+
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "admin_count", self.host,
+                ResultStatus.FAILED if self.last_search_error else ResultStatus.SUCCESS if resp_parsed else ResultStatus.NEGATIVE,
+                LDAPAccountSearchData(self.domain, searchFilter, resp_parsed), error=self.last_search_error,
+            )
 
     def gmsa(self):
         self.logger.display("Getting GMSA Passwords")
@@ -1512,56 +1740,65 @@ class ldap(connection):
         """
         # Convert LDAP time to human readable format
         def pso_days(ldap_time):
-            return f"{rd(seconds=int(abs(int(ldap_time)) / 10000000)).days} days"
+            return f"{abs(int(ldap_time)) / 864000000000:g} days" if ldap_time != "" else ""
 
         def pso_mins(ldap_time):
-            return f"{rd(seconds=int(abs(int(ldap_time)) / 10000000)).minutes} minutes"
+            return f"{abs(int(ldap_time)) / 600000000:g} minutes" if ldap_time != "" else ""
+
+        errors = []
+        assignments = []
 
         # Are there even any FGPPs?
         self.logger.info("Attempting to enumerate policies...")
-        resp = self.search(searchFilter="(objectclass=*)", baseDN=f"CN=Password Settings Container,CN=System,{self.baseDN}", attributes=[])
-        if len(resp) > 1:
-            self.logger.highlight(f"{len(resp) - 1} PSO Objects found!")
+        resp = self.search(searchFilter="(objectclass=msDS-PasswordSettings)", baseDN=f"CN=Password Settings Container,CN=System,{self.baseDN}", attributes=[])
+        if self.last_search_error:
+            errors.append(self.last_search_error)
+        count = len(parse_result_attributes(resp))
+        if count:
+            self.logger.highlight(f"{count} PSO Objects found!")
             self.logger.highlight("")
             self.logger.success("Attempting to enumerate objects with an applied policy...")
 
         # Who do they apply to?
         resp = self.search(searchFilter="(objectclass=*)", attributes=["DistinguishedName", "msDS-PSOApplied"])
-        resp_parsed = parse_result_attributes(resp)
-        for attrs in resp_parsed:
-            if "msDS-PSOApplied" in attrs:
-                # Get the distinguished name from the original response for objectName
-                for orig_resp in resp:
-                    if isinstance(orig_resp, ldapasn1_impacket.SearchResultEntry):
-                        self.logger.highlight(f"Object: {orig_resp['objectName']}")
-                        break
+        if self.last_search_error:
+            errors.append(self.last_search_error)
+        objects = [entry for entry in resp if isinstance(entry, ldapasn1_impacket.SearchResultEntry)]
+        for obj, attrs in zip(objects, parse_result_attributes(objects), strict=True):
+            pso_applied = next((value for key, value in attrs.items() if key.casefold() == "msds-psoapplied"), None)
+            if pso_applied:
+                dn = str(obj["objectName"])
+                assignments.append({"distinguished_name": dn, "policies": pso_applied if isinstance(pso_applied, list) else [pso_applied]})
+                self.logger.highlight(f"Object: {dn}")
                 self.logger.highlight("Applied Policy: ")
-                pso_applied = attrs["msDS-PSOApplied"]
                 self.logger.highlight(f"\t{pso_applied}")
                 self.logger.highlight("")
 
         # Let's find out even more details!
         self.logger.info("Attempting to enumerate details...\n")
         resp = self.search(searchFilter="(objectclass=msDS-PasswordSettings)",
-                           attributes=["name", "msds-lockoutthreshold", "msds-psoappliesto", "msds-minimumpasswordlength",
+                           attributes=["distinguishedName", "name", "msds-lockoutthreshold", "msds-psoappliesto", "msds-minimumpasswordlength",
                                        "msds-passwordhistorylength", "msds-lockoutobservationwindow", "msds-lockoutduration",
                                        "msds-passwordsettingsprecedence", "msds-passwordcomplexityenabled", "Description",
                                        "msds-passwordreversibleencryptionenabled", "msds-minimumpasswordage", "msds-maximumpasswordage"])
+        if self.last_search_error:
+            errors.append(self.last_search_error)
         resp_parsed = parse_result_attributes(resp)
-        for attrs in resp_parsed:
+        for attributes in resp_parsed:
+            attrs = {key.casefold(): value for key, value in attributes.items()}
             policyName = attrs.get("name", "")
             description = attrs.get("description", "")
-            passwordLength = attrs.get("msDS-MinimumPasswordLength", "")
-            passwordhistorylength = attrs.get("msDS-PasswordHistoryLength", "")
-            lockoutThreshold = attrs.get("msDS-LockoutThreshold", "")
-            observationWindow = attrs.get("msDS-LockoutObservationWindow", "")
-            lockoutDuration = attrs.get("msDS-LockoutDuration", "")
-            complexity = attrs.get("msDS-PasswordComplexityEnabled", "")
-            minPassAge = attrs.get("msDS-MinimumPasswordAge", "")
-            maxPassAge = attrs.get("msDS-MaximumPasswordAge", "")
-            reverseibleEncryption = attrs.get("msDS-PasswordReversibleEncryptionEnabled", "")
-            precedence = attrs.get("msDS-PasswordSettingsPrecedence", "")
-            policyApplies = attrs.get("msDS-PSOAppliesTo", "")
+            passwordLength = attrs.get("msds-minimumpasswordlength", "")
+            passwordhistorylength = attrs.get("msds-passwordhistorylength", "")
+            lockoutThreshold = attrs.get("msds-lockoutthreshold", "")
+            observationWindow = attrs.get("msds-lockoutobservationwindow", "")
+            lockoutDuration = attrs.get("msds-lockoutduration", "")
+            complexity = attrs.get("msds-passwordcomplexityenabled", "")
+            minPassAge = attrs.get("msds-minimumpasswordage", "")
+            maxPassAge = attrs.get("msds-maximumpasswordage", "")
+            reverseibleEncryption = attrs.get("msds-passwordreversibleencryptionenabled", "")
+            precedence = attrs.get("msds-passwordsettingsprecedence", "")
+            policyApplies = attrs.get("msds-psoappliesto", "")
 
             self.logger.highlight(f"Policy Name: {policyName}")
             if description:
@@ -1585,6 +1822,13 @@ class ldap(connection):
                 self.logger.highlight(f"\t{policyApplies}")
             self.logger.highlight("")
 
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "pso", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if resp_parsed or assignments else ResultStatus.NEGATIVE,
+                LDAPPSOData(resp_parsed, assignments), error="; ".join(errors) if errors else None,
+            )
+
     def pass_pol(self):
         search_filter = "(objectClass=domainDNS)"
         attributes = [
@@ -1604,7 +1848,7 @@ class ldap(connection):
 
         if not resp_parsed:
             self.logger.fail("No domain password policy found!")
-            return
+            return ActionResult("ldap", "pass_pol", self.host, ResultStatus.FAILED if self.last_search_error else ResultStatus.NEGATIVE, LDAPPasswordPolicyData(self.domain, "", "", "", "", "", "", "", "", ""), error=self.last_search_error) if self.playbook_mode else None
 
         for policy in resp_parsed:
             def ldap_to_filetime(ldap_time):
@@ -1669,12 +1913,20 @@ class ldap(connection):
             self.logger.highlight(f"Account Lockout Threshold: {accnt_lock_thres}")
             self.logger.highlight(f"Forced Log off Time: {force_logoff_time}")
 
+            if self.playbook_mode:
+                return ActionResult(
+                    "ldap", "pass_pol", self.host, ResultStatus.SUCCESS,
+                    LDAPPasswordPolicyData(
+                        str(self.domain), str(min_pass_len), str(pass_hist_len), str(max_pass_age), str(min_pass_age),
+                        str(pass_prop), str(rst_accnt_lock_counter), str(lock_accnt_dur), str(accnt_lock_thres), str(force_logoff_time),
+                    ),
+                )
             break  # Only process first policy result
 
     def bloodhound(self):
         collect, excluded = resolve_collection_methods("Default" if not self.args.collection else self.args.collection, self.logger)
         if not collect:
-            return
+            return self.make_bloodhound_result([], [], error="No collection methods resolved") if self.playbook_mode else None
         self.logger.highlight("Resolved collection methods: " + ", ".join(sorted(collect)))
         self.logger.highlight("Excluded collection methods: " + ", ".join(sorted(excluded)))
 
@@ -1685,7 +1937,7 @@ class ldap(connection):
         # ADCS collection is only compatible with BloodHound-CE
         if "adcs" in collect and not use_bhce:
             self.logger.fail("ADCS collection is only compatible with the BloodHound-CE collector, but legacy bloodhound is selected")
-            return
+            return self.make_bloodhound_result(collect, excluded, error="ADCS requires the BloodHound-CE collector") if self.playbook_mode else None
 
         if use_bhce and not is_ce:
             self.logger.fail("⚠️  Configuration Issue Detected ⚠️")
@@ -1699,7 +1951,7 @@ class ldap(connection):
             self.logger.fail("Or if you installed with pipx:")
             self.logger.fail("pipx runpip netexec uninstall -y bloodhound")
             self.logger.fail("pipx inject netexec bloodhound-ce --force")
-            return
+            return self.make_bloodhound_result(collect, excluded, error="BloodHound collector package does not match configuration") if self.playbook_mode else None
 
         elif not use_bhce and is_ce:
             self.logger.fail("⚠️  Configuration Issue Detected ⚠️")
@@ -1713,7 +1965,7 @@ class ldap(connection):
             self.logger.fail("Or if you installed with pipx:")
             self.logger.fail("pipx runpip netexec uninstall -y bloodhound-ce")
             self.logger.fail("pipx inject netexec bloodhound --force")
-            return
+            return self.make_bloodhound_result(collect, excluded, error="BloodHound collector package does not match configuration") if self.playbook_mode else None
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S") + "_"
         adcs_files = []
@@ -1747,7 +1999,7 @@ class ldap(connection):
                 ad.dns_resolve(domain=self.targetDomain)
             except (resolver.LifetimeTimeout, resolver.NoNameservers):
                 self.logger.fail("Bloodhound-python failed to resolve domain information, try specifying the DNS server.")
-                return
+                return self.make_bloodhound_result(collect, excluded, error="Failed to resolve domain information") if self.playbook_mode else None
 
             if self.args.kerberos:
                 self.logger.highlight("Using kerberos auth without ccache, getting TGT")
@@ -1773,11 +2025,11 @@ class ldap(connection):
             except Exception as e:
                 if "ldap3-bleeding-edge" in str(e):
                     self.logger.fail("Bloodhound collection failed due to channel binding requirements. Inject 'ldap3-bleeding-edge': pipx inject netexec ldap3-bleeding-edge")
-                    return
+                    return self.make_bloodhound_result(collect, excluded, error=str(e)) if self.playbook_mode else None
                 else:
                     self.logger.fail(f"BloodHound collection failed: {e.__class__.__name__} - {e}")
                     self.logger.debug(f"BloodHound collection failed: {e.__class__.__name__} - {e}", exc_info=True)
-                    return
+                    return self.make_bloodhound_result(collect, excluded, error=str(e)) if self.playbook_mode else None
 
         # Collect ADCS data using CertiHound if requested
         if "adcs" in collect:
@@ -1795,6 +2047,18 @@ class ldap(connection):
                 if os.path.exists(adcs_file):
                     z.write(adcs_file, os.path.basename(adcs_file))
                     os.remove(adcs_file)
+
+        if self.playbook_mode:
+            return self.make_bloodhound_result(collect, excluded, Path(f"{self.output_filename}_bloodhound.zip"))
+
+    def make_bloodhound_result(self, collect, excluded, archive=None, error=None):
+        return ActionResult(
+            "ldap", "bloodhound", self.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS,
+            BloodhoundData(sorted(collect), sorted(excluded), archive),
+            [Artifact(archive, "bloodhound_zip")] if archive else [],
+            error=error,
+        )
 
     def _collect_adcs_for_bloodhound(self, timestamp):
         """Collect ADCS data using CertiHound for BloodHound CE integration.

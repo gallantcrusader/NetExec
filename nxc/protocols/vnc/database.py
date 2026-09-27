@@ -1,6 +1,6 @@
 import warnings
 
-from sqlalchemy import Column, Integer, PrimaryKeyConstraint, String
+from sqlalchemy import Column, Integer, PrimaryKeyConstraint, String, insert, select
 from sqlalchemy.exc import SAWarning
 from sqlalchemy.orm import declarative_base
 
@@ -49,3 +49,24 @@ class database(BaseDB):
     def reflect_tables(self):
         self.HostsTable = self.reflect_table(self.Host)
         self.CredentialsTable = self.reflect_table(self.Credential)
+
+    def add_credential(self, username, password):
+        """Store a successful VNC password login once."""
+        q = select(self.CredentialsTable).filter(
+            self.CredentialsTable.c.username == username,
+            self.CredentialsTable.c.password == password,
+        )
+        row = self.db_execute(q).first()
+        if row is not None:
+            return row.id
+        result = self.db_execute(insert(self.CredentialsTable).values(username=username, password=password))
+        return result.inserted_primary_key[0]
+
+    def get_credentials(self, filter_term=None):
+        """Return credentials by ID, username, or all rows."""
+        q = select(self.CredentialsTable)
+        if isinstance(filter_term, int):
+            q = q.filter(self.CredentialsTable.c.id == filter_term)
+        elif filter_term:
+            q = q.filter(self.CredentialsTable.c.username == filter_term)
+        return self.db_execute(q).all()

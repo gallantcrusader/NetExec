@@ -4,6 +4,8 @@ import os
 import re
 import struct
 import ipaddress
+from dataclasses import dataclass, replace
+from copy import deepcopy
 from pathlib import Path
 
 from nxc.helpers.path import sanitize_filename
@@ -69,7 +71,7 @@ from nxc.protocols.smb.smbexec import SMBEXEC
 from nxc.protocols.smb.mmcexec import MMCEXEC
 from nxc.protocols.smb.smbspider import SMBSpider
 from nxc.protocols.smb.passpol import PassPolDump
-from nxc.protocols.smb.samruser import UserSamrDump
+from nxc.protocols.smb.samruser import SamrUser, UserSamrDump
 from nxc.protocols.smb.samrfunc import SamrFunc
 from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.logger import highlight
@@ -79,6 +81,7 @@ from nxc.helpers.rpc import NXCRPCConnection
 from nxc.helpers.powershell import create_ps_command
 from nxc.helpers.misc import detect_if_ip
 from nxc.protocols.ldap.resolution import LDAPResolution
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
 from dploot.lib.network.smb import SMBTarget as Target
 
@@ -106,6 +109,128 @@ smb_error_status = [
 ]
 
 
+@dataclass
+class ShareRecord:
+    name: str
+    remark: str
+    type: int
+    access: list[str]
+
+
+@dataclass
+class SharesData:
+    shares: list[ShareRecord]
+    signing_required: bool
+    anonymous_access: bool
+    guest_access: bool
+
+
+@dataclass
+class SMBUsersData:
+    users: list[SamrUser]
+
+
+@dataclass
+class LoggedOnUser:
+    domain: str
+    username: str
+    logon_server: str
+
+
+@dataclass
+class LoggedOnUsersData:
+    users: list[LoggedOnUser]
+
+
+@dataclass
+class SMBProcessRecord:
+    image_name: str
+    pid: int
+    session_id: int
+    sid: str
+    working_set_bytes: int
+
+
+@dataclass
+class SMBProcessesData:
+    processes: list[SMBProcessRecord]
+
+
+@dataclass
+class SMBSnapshotsData:
+    share: str
+    snapshots: list[str]
+
+
+@dataclass
+class SMBWMIQueryData:
+    query: str
+    namespace: str
+    records: list[dict]
+
+
+@dataclass
+class SMBDirectoryEntry:
+    name: str
+    path: str
+    is_directory: bool
+    readonly: bool
+    size: int
+    modified_epoch: float
+
+
+@dataclass
+class SMBDirectoryData:
+    share: str
+    path: str
+    entries: list[SMBDirectoryEntry]
+
+
+@dataclass
+class SMBTransferRecord:
+    share: str
+    remote_path: str
+    local_path: Path
+    bytes_transferred: int = 0
+    completed: bool = False
+    error: str | None = None
+
+
+@dataclass
+class SMBTransfersData:
+    files: list[SMBTransferRecord]
+
+
+@dataclass
+class SMBDisksData:
+    disks: list[str]
+
+
+@dataclass
+class LocalGroupsData:
+    groups: dict[str, int]
+    members: dict[str, str]
+    members_queried: bool
+
+
+@dataclass
+class TerminalSessionsData:
+    sessions: list[dict]
+
+
+@dataclass
+class SMBPasswordPolicyData:
+    min_password_length: int | str | None
+    password_history_length: int | str | None
+    maximum_password_age: str | None
+    minimum_password_age: str | None
+    password_complexity_flags: str | None
+    lockout_reset_time: str | None
+    lockout_duration: str | None
+    lockout_threshold: int | str | None
+    forced_logoff_time: str | None
+
+
 def get_error_string(exception):
     if hasattr(exception, "getErrorString"):
         try:
@@ -121,7 +246,7 @@ def get_error_string(exception):
 
 
 class smb(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.domain = None
         self.server_os = None
         self.server_os_major = None
@@ -150,7 +275,7 @@ class smb(connection):
 
         self._dpapi_triage = None
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -456,6 +581,15 @@ class smb(connection):
             out = f"{self.domain}\\{self.username}{used_ccache} {self.mark_pwned()}"
             self.logger.success(out)
 
+            if username and not self.is_guest:
+                self.credential_username = username
+                if password:
+                    self.db.add_credential("plaintext", domain, username, password)
+                elif ntlm_hash:
+                    self.db.add_credential("hash", domain, username, self.hash)
+                elif aesKey:
+                    self.db.add_credential("aesKey", domain, username, aesKey)
+
             if not self.args.local_auth and self.username != "" and not self.args.delegate:
                 add_user_bh(self.username, domain, self.logger, self.config)
             if self.admin_privs:
@@ -727,26 +861,38 @@ class smb(connection):
             return self.create_smbv1_conn()
 
     def check_if_admin(self):
+        self.admin_check_result = None
+        self.admin_check_error = None
+        self.admin_privs = False
         if self.args.no_admin_check:
             return
         self.logger.debug(f"Checking if user is admin on {self.host}")
+        rpc = NXCRPCConnection(self)
+        handle = None
         try:
-            dce = NXCRPCConnection(self).connect(r"\svcctl", scmr.MSRPC_UUID_SCMR)
-        except Exception:
-            self.admin_privs = False
-            return
-        try:
+            dce = rpc.connect(r"\svcctl", scmr.MSRPC_UUID_SCMR)
             # 0xF003F - SC_MANAGER_ALL_ACCESS
             # http://msdn.microsoft.com/en-us/library/windows/desktop/ms685981(v=vs.85).aspx
             scmrobj = scmr.hROpenSCManagerW(dce, f"{self.host}\x00", "ServicesActive\x00", 0xF003F)
-            scmr.hREnumServicesStatusW(dce, scmrobj["lpScHandle"])
+            handle = scmrobj["lpScHandle"]
+            scmr.hREnumServicesStatusW(dce, handle)
             self.logger.debug(f"User is admin on {self.host}!")
             self.admin_privs = True
-        except scmr.DCERPCException:
-            self.admin_privs = False
+            self.admin_check_result = True
+        except scmr.DCERPCException as e:
+            if e.get_error_code() == 5:  # ERROR_ACCESS_DENIED
+                self.admin_check_result = False
+            else:
+                self.admin_check_error = str(e) or type(e).__name__
+                self.logger.fail(f"Error checking if user is admin on {self.host}: {e}")
         except Exception as e:
+            self.admin_check_error = str(e) or type(e).__name__
             self.logger.fail(f"Error checking if user is admin on {self.host}: {e}")
-            self.admin_privs = False
+        finally:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    scmr.hRCloseServiceHandle(dce, handle)
+            rpc.disconnect()
 
     def gen_relay_list(self):
         if self.server_os.lower().find("windows") != -1 and self.signing is False:
@@ -1203,8 +1349,10 @@ class smb(connection):
     def get_session_list(self):
         with TSTS.TermSrvEnumeration(self.conn, self.host, self.kerberos) as lsm:
             handle = lsm.hRpcOpenEnum()
-            rsessions = lsm.hRpcGetEnumResult(handle, Level=1)["ppSessionEnumResult"]
-            lsm.hRpcCloseEnum(handle)
+            try:
+                rsessions = lsm.hRpcGetEnumResult(handle, Level=1)["ppSessionEnumResult"]
+            finally:
+                lsm.hRpcCloseEnum(handle)
             sessions = {}
             for i in rsessions:
                 sess = i["SessionInfo"]["SessionEnum_Level1"]
@@ -1222,6 +1370,7 @@ class smb(connection):
             return sessions
 
     def enumerate_sessions_info(self, sessions):
+        errors = []
         if len(sessions):
             with TSTS.TermSrvSession(self.conn, self.host, self.kerberos) as TermSrvSession:
                 for SessionId in sessions:
@@ -1248,9 +1397,12 @@ class smb(connection):
                                 continue
                             sessions[SessionId]["RemoteIp"] = client["pRemoteAddress"]["ipv4"]["in_addr"]
                         except Exception as e:
+                            errors.append(f"Session {SessionId} remote address: {e}")
                             self.logger.debug(f"Error getting client address for session {SessionId}: {e}")
-            except SessionError:
+            except SessionError as e:
+                errors.append(f"Remote addresses: {e}")
                 self.logger.fail("RDP is probably not enabled, cannot list remote IPv4 addresses.")
+        return errors
 
     @requires_admin
     def taskkill(self):
@@ -1278,8 +1430,40 @@ class smb(connection):
                 except Exception as e:
                     self.logger.exception(f"Error terminating PID {pid}: {e}")
 
+    def qwinsta_result(self):
+        sessions = {}
+        errors = []
+        records = []
+        try:
+            sessions = self.get_session_list()
+            errors.extend(self.enumerate_sessions_info(sessions) or [])
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+            self.logger.fail(f"Error enumerating terminal sessions: {e}")
+
+        usernames = None
+        if self.args.qwinsta:
+            if os.path.isfile(self.args.qwinsta):
+                with open(self.args.qwinsta) as users:
+                    usernames = {line.strip().casefold() for line in users if line.strip()}
+            else:
+                usernames = {self.args.qwinsta.casefold()}
+        for session_id, session in sessions.items():
+            if usernames and session.get("Username", "").casefold() not in usernames:
+                continue
+            records.append({"id": session_id, **session})
+            self.logger.highlight(f"Session {session_id}: {session.get('Domain', '')}\\{session.get('Username', '')} ({session.get('state', '')})")
+        return ActionResult(
+            "smb", "qwinsta", self.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+            TerminalSessionsData(records), error="; ".join(errors) or None,
+            inputs={"qwinsta": self.args.qwinsta},
+        )
+
     @requires_admin
     def qwinsta(self):
+        if self.playbook_mode:
+            return self.qwinsta_result()
         desktop_states = {
             "WTS_SESSIONSTATE_UNKNOWN": "",
             "WTS_SESSIONSTATE_LOCK": "Locked",
@@ -1288,7 +1472,7 @@ class smb(connection):
 
         sessions = self.get_session_list()
         if not sessions:
-            return
+            return None
 
         self.enumerate_sessions_info(sessions)
 
@@ -1377,53 +1561,39 @@ class smb(connection):
 
     @requires_admin
     def tasklist(self):
-        # Formats a row to be printed on screen
-        def format_row(procInfo):
-            return template.format(
-                procInfo["ImageName"],
-                procInfo["UniqueProcessId"],
-                procInfo["SessionId"],
-                procInfo["pSid"],
-                f"{procInfo['WorkingSetSize'] // 1000:,} K",
-            )
-
+        records = []
+        errors = []
         try:
             with TSTS.LegacyAPI(self.conn, self.host, self.kerberos) as legacy:
+                handle = legacy.hRpcWinStationOpenServer()
                 try:
-                    handle = legacy.hRpcWinStationOpenServer()
-                    res = legacy.hRpcWinStationGetAllProcesses(handle)
-                except Exception as e:
-                    # TODO: Issue https://github.com/fortra/impacket/issues/1816
-                    self.logger.debug(f"Exception while calling hRpcWinStationGetAllProcesses: {e}")
-                    return
-                if not res:
-                    return
-                self.logger.success("Enumerated processes")
-                maxImageNameLen = max(len(i["ImageName"]) for i in res)
-                maxSidLen = max(len(i["pSid"]) for i in res)
-                template = f"{{: <{maxImageNameLen}}} {{: <8}} {{: <11}} {{: <{maxSidLen}}} {{: >12}}"
-                self.logger.highlight(template.format("Image Name", "PID", "Session#", "SID", "Mem Usage"))
-                self.logger.highlight(template.replace(": ", ":=").format("", "", "", "", ""))
-                found_task = False
-
-                # For each process on the remote host
-                for procInfo in res:
-                    # If args.tasklist is not True then a process name was supplied
-                    if self.args.tasklist is not True:
-                        # So we look for it and print its information if found
-                        if self.args.tasklist.lower() in procInfo["ImageName"].lower():
-                            found_task = True
-                            self.logger.highlight(format_row(procInfo))
-                    # Else, no process was supplied, we print the entire list of remote processes
-                    else:
-                        self.logger.highlight(format_row(procInfo))
-
-                # If a process was suppliad to args.tasklist and it was not found, we print a fail message
-                if self.args.tasklist is not True and not found_task:
-                    self.logger.fail(f"Didn't find process {self.args.tasklist}")
-
-        except SessionError:
-            self.logger.fail("Cannot list remote tasks, RDP is probably disabled.")
+                    for process in legacy.hRpcWinStationGetAllProcesses(handle):
+                        name = process["ImageName"]
+                        if self.args.tasklist is not True and self.args.tasklist and self.args.tasklist.casefold() not in name.casefold():
+                            continue
+                        record = SMBProcessRecord(name, int(process["UniqueProcessId"]), int(process["SessionId"]), str(process["pSid"]), int(process["WorkingSetSize"]))
+                        records.append(record)
+                        self.logger.highlight(f"{record.image_name} PID={record.pid} Session={record.session_id} SID={record.sid} WorkingSetBytes={record.working_set_bytes}")
+                finally:
+                    try:
+                        response = legacy.hRpcWinStationCloseServer(handle)
+                        if not response["ErrorCode"]:
+                            errors.append(f"Closing terminal server handle failed: {response['pResult']}")
+                    except Exception as e:
+                        errors.append(f"Closing terminal server handle: {e}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        for error in errors:
+            self.logger.fail(error)
+        if not records and not errors:
+            self.logger.display("No matching processes found")
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "tasklist", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+                SMBProcessesData(records), error="; ".join(errors) or None,
+                inputs={"tasklist": self.args.tasklist},
+            )
 
     def reg_sessions(self):
 
@@ -1596,14 +1766,14 @@ class smb(connection):
                 f"Error enumerating shares: {error}",
                 color="magenta" if error in smb_error_status else "red",
             )
-            return permissions
+            return self.make_shares_result(permissions, error) if self.playbook_mode else permissions
         except Exception as e:
             error = get_error_string(e)
             self.logger.fail(
                 f"Error enumerating shares: {error}",
                 color="magenta" if error in smb_error_status else "red",
             )
-            return permissions
+            return self.make_shares_result(permissions, error) if self.playbook_mode else permissions
 
         for share in shares:
             share_name = share["shi1_netname"].rstrip("\x00")
@@ -1757,28 +1927,50 @@ class smb(connection):
             if self.args.shares and self.args.shares.lower() not in perms.lower():
                 continue
             self.logger.highlight(f"{name:<15} {perms:<22} {remark}")
-        return permissions
+        return self.make_shares_result(permissions) if self.playbook_mode else permissions
+
+    def make_shares_result(self, permissions, error=None):
+        return ActionResult(
+            protocol="smb",
+            action="shares",
+            target=self.host,
+            status=ResultStatus.FAILED if error else ResultStatus.SUCCESS,
+            data=SharesData(
+                shares=[ShareRecord(**share) for share in permissions],
+                signing_required=self.signing,
+                anonymous_access=self.null_auth,
+                guest_access=bool(self.is_guest),
+            ),
+            error=error,
+            inputs={"shares": self.args.shares, "exclude_shares": self.args.exclude_shares, "file_write_check": self.args.file_write_check},
+        )
 
     def dir(self):
         search_path = ntpath.join(self.args.dir, "*")
+        records = []
+        error = None
         try:
             contents = self.conn.listPath(self.args.share, search_path)
-        except SessionError as e:
-            error = get_error_string(e)
-            self.logger.fail(
-                f"Error enumerating '{search_path}': {error}",
-                color="magenta" if error in smb_error_status else "red",
+            if contents:
+                self.logger.highlight(f"{'Type':<9}{'Read Only':<12}{'File Size':<15}{'Date':<30}{'File Path':<45}")
+            for content in contents:
+                record = SMBDirectoryEntry(
+                    content.get_longname(), ntpath.join(self.args.dir, content.get_longname()),
+                    bool(content.is_directory()), bool(content.is_readonly()),
+                    int(content.get_filesize()), float(content.get_mtime_epoch()),
+                )
+                records.append(record)
+                self.logger.highlight(f"{'d' if record.is_directory else 'f':<9}{record.readonly!s:<12}{record.size:<15}{ctime(record.modified_epoch):<30}{record.path:<45}")
+        except Exception as e:
+            error = get_error_string(e) if isinstance(e, SessionError) else str(e) or type(e).__name__
+            self.logger.fail(f"Error enumerating '{search_path}': {error}", color="magenta" if error in smb_error_status else "red")
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "dir", self.host,
+                ResultStatus.FAILED if error else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+                SMBDirectoryData(self.args.share, self.args.dir, records), error=error,
+                inputs={"dir": self.args.dir, "share": self.args.share},
             )
-            return
-
-        if not contents:
-            return
-
-        self.logger.highlight(f"{'Perms':<9}{'File Size':<15}{'Date':<30}{'File Path':<45}")
-        self.logger.highlight(f"{'-----':<9}{'---------':<15}{'----':<30}{'---------':<45}")
-        for content in contents:
-            full_path = ntpath.join(self.args.dir, content.get_longname())
-            self.logger.highlight(f"{'d' if content.is_directory() else 'f'}{'rw-' if content.is_readonly() > 0 else 'r--':<8}{content.get_filesize():<15}{ctime(float(content.get_mtime_epoch())):<30}{full_path:<45}")
 
     def interfaces(self):
         """
@@ -1902,40 +2094,64 @@ class smb(connection):
         return
 
     def disks(self):
+        disks = []
+        errors = []
+        dce = None
         try:
             dce = NXCRPCConnection(self).connect(r"\srvsvc", srvs.MSRPC_UUID_SRVS)
-
             response = srvs.hNetrServerDiskEnum(dce, 0)
-            # Process the response
             self.logger.display("Enumerated disks:")
             for disk in response["DiskInfoStruct"]["Buffer"]:
-                if disk["Disk"] != "\x00":
-                    self.logger.highlight(disk["Disk"])
+                name = disk["Disk"].rstrip("\x00")
+                if name:
+                    disks.append(name)
+                    self.logger.highlight(name)
         except Exception as e:
+            errors.append(str(e) or type(e).__name__)
             self.logger.fail(f"Failed to enumerate disks: {e}")
+        finally:
+            if dce is not None:
+                try:
+                    dce.disconnect()
+                except Exception as e:
+                    errors.append(str(e) or type(e).__name__)
+                    self.logger.fail(f"Failed to close disk enumeration RPC: {e}")
+        if self.playbook_mode:
+            return ActionResult("smb", "disks", self.host, ResultStatus.FAILED if errors else ResultStatus.SUCCESS if disks else ResultStatus.NEGATIVE, SMBDisksData(disks), error="; ".join(errors) or None)
 
     def local_groups(self):
         self.logger.display("Enumerating with SAMRPC protocol")
+        groups, members = {}, {}
+        errors = []
+        query = None
         try:
-            groups, members = SamrFunc(self).get_local_groups(self.args.local_groups)
-        except DCERPCException as e:
+            query = SamrFunc(self)
+            groups, members = query.get_local_groups(self.args.local_groups)
+            errors.extend(query.errors)
+            if groups and not self.args.local_groups:
+                self.logger.success("Enumerated local groups")
+                for group_name, group_rid in groups.items():
+                    self.logger.highlight(f"{group_rid} - {group_name}")
+                    group_id = self.db.add_group(self.hostname, group_name, rid=group_rid)[0]
+                    self.logger.debug(f"Added group, returned id: {group_id}")
+            elif groups and members:
+                self.logger.success(f"Enumerated users of local groups: {', '.join(groups)}")
+                members = dict(sorted(members.items(), key=lambda item: int(item[0].split("-")[-1])))
+                for member, name in members.items():
+                    self.logger.highlight(f"{member} - {name}")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
             self.logger.fail(f"Error enumerating local groups: {e}")
-            return
-
-        if groups and not self.args.local_groups:
-            self.logger.success("Enumerated local groups")
-            self.logger.debug(f"Local groups: {groups}")
-
-            for group_name, group_rid in groups.items():
-                self.logger.highlight(f"{group_rid} - {group_name}")
-                group_id = self.db.add_group(self.hostname, group_name, rid=group_rid)[0]
-                self.logger.debug(f"Added group, returned id: {group_id}")
-        elif groups and members:
-            self.logger.success(f"Enumerated users of local groups: {groups.popitem()[0]}")
-
-            members = dict(sorted(members.items(), key=lambda item: int(item[0].split("-")[-1])))
-            for member in members:
-                self.logger.highlight(f"{member} - {members[member]}")
+        finally:
+            if query is not None:
+                errors.extend(query.close())
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "local_groups", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if groups else ResultStatus.NEGATIVE,
+                LocalGroupsData(groups, members, bool(self.args.local_groups)), error="; ".join(errors) or None,
+                inputs={"local_groups": self.args.local_groups},
+            )
 
     def groups(self):
         self.logger.fail("[REMOVED] Arg moved to the ldap protocol")
@@ -1944,10 +2160,16 @@ class smb(connection):
     def users(self):
         if self.args.users:
             self.logger.debug(f"Dumping users: {', '.join(self.args.users)}")
-        return UserSamrDump(self).dump(requested_users=self.args.users, dump_path=self.args.users_export)
+        dump = UserSamrDump(self)
+        users = dump.dump(requested_users=self.args.users, dump_path=self.args.users_export)
+        if self.playbook_mode:
+            artifacts = [Artifact(Path(self.args.users_export), "user_list")] if dump.exported else []
+            return ActionResult("smb", "users", self.host, ResultStatus.FAILED if dump.error else ResultStatus.SUCCESS, SMBUsersData(dump.user_records), artifacts, error=dump.error, inputs={"users": self.args.users, "users_export": self.args.users_export})
+        return users
 
     def users_export(self):
-        self.users()
+        result = self.users()
+        return replace(result, action="users_export") if self.playbook_mode else None
 
     def computers(self):
         self.logger.fail("[REMOVED] Arg moved to the ldap protocol")
@@ -1958,6 +2180,8 @@ class smb(connection):
             self.logger.fail("[REMOVED] Use option '--loggedon-users <USERNAME>' for filtering")
 
         logged_on = set()
+        records = []
+        error = None
         try:
             dce = NXCRPCConnection(self).connect(r"\wkssvc", wkst.MSRPC_UUID_WKST)
 
@@ -1968,62 +2192,102 @@ class smb(connection):
                     logged_on.add(user_info)
                     if self.args.loggedon_users:
                         if re.match(self.args.loggedon_users, user_info[1]):
+                            records.append(LoggedOnUser(*user_info))
                             self.logger.highlight(f"{user_info[0]}\\{user_info[1]:<25} logon_server: {user_info[2]}")
                     else:
+                        records.append(LoggedOnUser(*user_info))
                         self.logger.highlight(f"{user_info[0]}\\{user_info[1]:<25} logon_server: {user_info[2]}")
         except Exception as e:
+            error = str(e) or type(e).__name__
             self.logger.fail(f"Error enumerating logged on users: {e}")
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "loggedon_users", self.host,
+                ResultStatus.FAILED if error else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+                LoggedOnUsersData(records), error=error, inputs={"loggedon_users": self.args.loggedon_users},
+            )
 
     def pass_pol(self):
-        return PassPolDump(self).dump()
+        dump = PassPolDump(self)
+        policy = dump.dump()
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "pass_pol", self.host,
+                ResultStatus.FAILED if dump.error else ResultStatus.SUCCESS if policy else ResultStatus.NEGATIVE,
+                SMBPasswordPolicyData(
+                    policy.get("min_pass_len"), policy.get("pass_hist_len"), policy.get("max_pass_age"),
+                    policy.get("min_pass_age"), policy.get("pass_prop"), policy.get("rst_accnt_lock_counter"),
+                    policy.get("lock_accnt_dur"), policy.get("accnt_lock_thres"), policy.get("force_logoff_time"),
+                ),
+                error=dump.error,
+            )
+        return policy
 
     @requires_admin
     def wmi_query(self, wql=None, namespace=None, callback_func=None):
+        typed = self.playbook_mode and wql is None and namespace is None and callback_func is None
+        query = wql if wql is not None else self.args.wmi_query.strip("\n")
+        namespace = namespace or self.args.wmi_namespace
         records = []
-        if not wql:
-            wql = self.args.wmi_query.strip("\n")
-
-        if not namespace:
-            namespace = self.args.wmi_namespace
-
+        errors = []
+        resources = []
+        dcom = None
         try:
             dcom = DCOMConnection(self.remoteName, self.username, self.password, self.domain, self.lmhash, self.nthash, oxidResolver=True, doKerberos=self.kerberos, kdcHost=self.kdcHost, aesKey=self.aesKey, remoteHost=self.host)
-            iInterface = dcom.CoCreateInstanceEx(CLSID_WbemLevel1Login, IID_IWbemLevel1Login)
-            flag, stringBinding = dcom_FirewallChecker(iInterface, self.host, self.args.dcom_timeout)
-            if not flag or not stringBinding:
-                error_msg = f"WMI Query: Dcom initialization failed on connection with stringbinding: '{stringBinding}', please increase the timeout with the option '--dcom-timeout'. If it's still failing maybe something is blocking the RPC connection, try another exec method"
-
-                if not stringBinding:
-                    error_msg = "WMI Query: Dcom initialization failed: can't get target stringbinding, maybe cause by IPv6 or any other issues, please check your target again"
-
-                self.logger.fail(error_msg) if not flag else self.logger.debug(error_msg)
-                # Make it force break function
-                dcom.disconnect()
-            iWbemLevel1Login = IWbemLevel1Login(iInterface)
-            iWbemServices = iWbemLevel1Login.NTLMLogin(namespace, NULL, NULL)
-            iWbemLevel1Login.RemRelease()
-            iEnumWbemClassObject = iWbemServices.ExecQuery(wql)
+            interface = dcom.CoCreateInstanceEx(CLSID_WbemLevel1Login, IID_IWbemLevel1Login)
+            login = IWbemLevel1Login(interface)
+            resources.append(login)
+            flag, binding = dcom_FirewallChecker(interface, self.host, self.args.dcom_timeout)
+            if not flag or not binding:
+                raise RuntimeError("WMI DCOM binding unavailable; check connectivity and dcom_timeout")
+            services = login.NTLMLogin(namespace, NULL, NULL)
+            resources.append(services)
+            enumerator = services.ExecQuery(query)
+            resources.append(enumerator)
+            if callback_func:
+                callback_func(enumerator, records)
+            else:
+                while True:
+                    try:
+                        objects = enumerator.Next(0xFFFFFFFF, 1)
+                    except Exception as e:
+                        if "S_FALSE" in str(e):
+                            break
+                        raise
+                    if not objects:
+                        break
+                    for obj in objects:
+                        try:
+                            record = deepcopy(obj.getProperties())
+                            records.append(record)
+                            for name, value in record.items():
+                                if name != "TimeGenerated":
+                                    self.logger.highlight(f"{name} => {value['value']}")
+                        finally:
+                            obj.RemRelease()
         except Exception as e:
-            self.logger.fail(f"Execute WQL error: {e}")
-            if "iWbemLevel1Login" in locals():
-                dcom.disconnect()
-        else:
-            self.logger.info(f"Executing WQL syntax: {wql}")
-            try:
-                if not callback_func:
-                    while True:
-                        wmi_results = iEnumWbemClassObject.Next(0xFFFFFFFF, 1)[0]
-                        record = wmi_results.getProperties()
-                        records.append(record)
-                        for k, v in record.items():
-                            if k != "TimeGenerated":  # from the wcc module, but this is a small hack to get it to stop spamming - TODO: add in method to disable output for this function
-                                self.logger.highlight(f"{k} => {v['value']}")
-                else:
-                    callback_func(iEnumWbemClassObject, records)
-            except Exception as e:
-                if str(e).find("S_FALSE") < 0:
-                    self.logger.debug(e)
-            dcom.disconnect()
+            if not (callback_func and "S_FALSE" in str(e)):
+                errors.append(str(e) or type(e).__name__)
+        finally:
+            for resource in reversed(resources):
+                try:
+                    resource.RemRelease()
+                except Exception as e:
+                    errors.append(f"Releasing WMI resource: {e}")
+            if dcom is not None:
+                try:
+                    dcom.disconnect()
+                except Exception as e:
+                    errors.append(f"Closing WMI DCOM connection: {e}")
+        self.last_wmi_error = "; ".join(errors) or None
+        if errors:
+            self.logger.fail(self.last_wmi_error)
+        if typed:
+            return ActionResult(
+                "smb", "wmi_query", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+                SMBWMIQueryData(query, namespace, records), error=self.last_wmi_error,
+            )
         return records
 
     def spider(
@@ -2146,6 +2410,8 @@ class smb(connection):
                 self.logger.fail(f"Error writing file to share {self.args.share}: {e}")
 
     def put_file(self):
+        if self.playbook_mode:
+            return self.transfer_files("put_file")
         for src, dest in self.args.put_file:
             self.put_file_single(src, dest)
 
@@ -2184,8 +2450,63 @@ class smb(connection):
                         self.logger.fail(f"Error downloading file '{remote_path}' from share '{share_name}'")
 
     def get_file(self):
+        if self.playbook_mode:
+            return self.transfer_files("get_file")
         for src, dest in self.args.get_file:
             self.get_file_single(src, dest)
+
+    def transfer_files(self, action):
+        records = []
+        artifacts = []
+        downloading = action == "get_file"
+        for source, destination in getattr(self.args, action):
+            remote_path = source if downloading else destination
+            local_path = Path(destination if downloading else source)
+            if downloading and self.args.append_host:
+                local_path = local_path.with_name(f"{sanitize_filename(self.hostname)}-{local_path.name}")
+            record = SMBTransferRecord(self.args.share, remote_path, local_path)
+            records.append(record)
+            created = False
+            try:
+                with local_path.open("wb" if downloading else "rb") as file:
+                    created = downloading
+                    if downloading:
+                        def receive(data, record=record, file=file):
+                            record.bytes_transferred += file.write(data)
+
+                        try:
+                            self.conn.getFile(self.args.share, remote_path, receive, shareAccessMode=FILE_READ_DATA)
+                        except SessionError as e:
+                            if "STATUS_SHARING_VIOLATION" not in str(e):
+                                raise
+                            # A retry replaces any partial first attempt.
+                            file.seek(0)
+                            file.truncate()
+                            record.bytes_transferred = 0
+                            self.conn.getFile(self.args.share, remote_path, receive, shareAccessMode=FILE_READ_DATA | FILE_WRITE_DATA)
+                    else:
+                        def send(size, record=record, file=file):
+                            data = file.read(size)
+                            record.bytes_transferred += len(data)
+                            return data
+
+                        self.conn.putFile(self.args.share, remote_path, send)
+                record.completed = True
+                self.logger.success(f"Transferred '{source}' to '{destination}'")
+            except Exception as e:
+                record.error = str(e) or type(e).__name__
+                self.logger.fail(f"Error transferring '{source}' to '{destination}': {e}")
+            if created:
+                artifacts.append(Artifact(local_path, "download" if record.completed else "partial_download"))
+            if record.error:
+                break
+        error = next((record.error for record in records if record.error), None)
+        return ActionResult(
+            "smb", action, self.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS if records else ResultStatus.NEGATIVE,
+            SMBTransfersData(records), artifacts=artifacts, error=error,
+            inputs={action: getattr(self.args, action), "share": self.args.share, **({"append_host": self.args.append_host} if downloading else {})},
+        )
 
     def download_folder(self, folder, dest, recursive=False, silent=False, base_dir=None, ignore_empty=False):
         folder = ntpath.normpath(folder)
@@ -2353,17 +2674,34 @@ class smb(connection):
 
     @requires_admin
     def list_snapshots(self):
-        drive = self.args.list_snapshots
-
-        self.logger.info(f"Retrieving volume shadow copies of drive {drive}.")
-        snapshots = self.conn.listSnapshots(self.conn.connectTree(drive), "/")
-        if not snapshots:
-            self.logger.info("No volume shadow copies found.")
-            return
-        self.logger.highlight(f"{'Drive':<8}{'Shadow Copies GMT SMB PATH':<26}")
-        self.logger.highlight(f"{'------':<8}{'--------------------------':<26}")
-        for i in snapshots:
-            self.logger.highlight(f"{drive:<8}{i:<26}")
+        share = self.args.list_snapshots
+        snapshots = []
+        errors = []
+        tree = None
+        try:
+            tree = self.conn.connectTree(share)
+            snapshots = self.conn.listSnapshots(tree, "/")
+            for snapshot in snapshots:
+                self.logger.highlight(f"{share}: {snapshot}")
+            if not snapshots:
+                self.logger.info("No volume shadow copies found.")
+        except Exception as e:
+            errors.append(str(e) or type(e).__name__)
+        finally:
+            if tree is not None:
+                try:
+                    self.conn.disconnectTree(tree)
+                except Exception as e:
+                    errors.append(f"Disconnecting snapshot tree: {e}")
+        for error in errors:
+            self.logger.fail(error)
+        if self.playbook_mode:
+            return ActionResult(
+                "smb", "list_snapshots", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if snapshots else ResultStatus.NEGATIVE,
+                SMBSnapshotsData(share, snapshots), error="; ".join(errors) or None,
+                inputs={"list_snapshots": share},
+            )
 
     @requires_admin
     def lsa(self, quiet=False):

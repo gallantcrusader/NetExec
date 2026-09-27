@@ -1,3 +1,5 @@
+from nxc.playbooks.screenshots import capture_screenshot
+
 import asyncio
 from datetime import datetime
 from anyio import Path
@@ -19,7 +21,7 @@ import contextlib
 
 
 class vnc(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.iosettings = RDPIOSettings()
         self.iosettings.channels = []
         self.iosettings.video_out_format = VIDEO_FORMAT.RAW
@@ -30,7 +32,7 @@ class vnc(connection):
         self.RFBversion = None
         self.noauth = False  # True when security type is 1
         self.stype = None
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -136,6 +138,10 @@ class vnc(connection):
             asyncio.run(self.connect_vnc())
 
             self.admin_privs = True
+            self.username = username
+            self.password = password
+            if password:
+                self.db.add_credential(username, password)
             self.logger.success(
                 "{} {}".format(
                     password,
@@ -155,14 +161,22 @@ class vnc(connection):
             return False
 
     async def screen(self):
-        self.conn = VNCConnection(target=self.target, credentials=self.credential, iosettings=self.iosettings)
-        await self.connect_vnc()
-        await asyncio.sleep(int(self.args.screentime))
-        if self.conn is not None and self.conn.desktop_buffer_has_data is True:
-            buffer = self.conn.get_desktop_buffer(VIDEO_FORMAT.PIL)
-            filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.png").expanduser()
-            buffer.save(filename, "png")
-            self.logger.highlight(f"Screenshot saved {filename}")
+        try:
+            self.conn = VNCConnection(target=self.target, credentials=self.credential, iosettings=self.iosettings)
+            await self.connect_vnc()
+            await asyncio.sleep(int(self.args.screentime))
+            if self.conn is not None and self.conn.desktop_buffer_has_data is True:
+                buffer = self.conn.get_desktop_buffer(VIDEO_FORMAT.PIL)
+                filename = await Path(f"{NXC_PATH}/screenshots/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S_%f')}.png").expanduser()
+                await filename.parent.mkdir(parents=True, exist_ok=True)
+                buffer.save(filename, "png")
+                self.logger.highlight(f"Screenshot saved {filename}")
+                return filename
+        finally:
+            if self.conn is not None:
+                await asyncio.wait_for(self.conn.terminate(), timeout=self.args.vnc_timeout)
 
     def screenshot(self):
+        if self.playbook_mode:
+            return capture_screenshot("vnc", "screenshot", self.host, self.screen)
         asyncio.run(self.screen())

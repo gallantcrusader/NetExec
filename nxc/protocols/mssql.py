@@ -1,9 +1,13 @@
+from dataclasses import dataclass
+from copy import deepcopy
+
 import os
 import random
 import contextlib
 import binascii
 from termcolor import colored
 
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection
 from nxc.connection import requires_admin
@@ -37,8 +41,15 @@ from impacket.tds import (
 from impacket.examples.secretsdump import LocalOperations, LSASecrets, SAMHashes
 
 
+@dataclass
+class MSSQLQueryData:
+    query: str
+    columns: list[str]
+    rows: list
+
+
 class mssql(connection):
-    def __init__(self, args, db, host):
+    def __init__(self, args, db, host, defer_flow=False):
         self.mssql_instances = []
         self.domain = ""
         self.targetDomain = ""
@@ -56,7 +67,7 @@ class mssql(connection):
 
         self._dpapi_triage = None
 
-        connection.__init__(self, args, db, host)
+        connection.__init__(self, args, db, host, defer_flow=defer_flow)
 
     def proto_logger(self):
         self.logger = NXCAdapter(
@@ -221,6 +232,14 @@ class mssql(connection):
             if res is not True:
                 raise
             self.check_if_admin()
+            if self.username:
+                if password:
+                    self.db.add_credential("plaintext", domain, self.username, password)
+                elif self.nthash:
+                    self.hash = self.nthash
+                    self.db.add_credential("hash", domain, self.username, self.nthash)
+                elif aesKey:
+                    self.db.add_credential("aesKey", domain, self.username, aesKey)
             self.logger.success(f"{self.domain}\\{self.username}{used_ccache} {self.mark_pwned()}")
             if not self.args.local_auth and self.username != "":
                 add_user_bh(self.username, self.domain, self.logger, self.config)
@@ -304,27 +323,35 @@ class mssql(connection):
             return False
 
     def query(self):
-        if self.conn.lastError:
+        if self.conn.lastError and not self.playbook_mode:
             # Invalid connection
             self.logger.debug(f"Cannot execute query due to invalid connection: {self.conn.lastError}")
             return None
         self.logger.info(f"Query to run: {self.args.query}")
+        raw_output = []
+        error = None
         try:
-            raw_output = self.conn.sql_query(self.args.query)
+            raw_output = self.conn.sql_query(self.args.query, tuplemode=True) if self.playbook_mode else self.conn.sql_query(self.args.query)
             self.logger.debug(f"Raw output: {raw_output}")
             if self.conn.lastError:
+                error = str(self.conn.lastError)
                 self.logger.debug(f"Error during query execution: {self.conn.lastError}")
                 self.logger.fail(self.conn.lastError)
             else:
                 for data in raw_output:
-                    for key, value in data.items():
+                    items = zip([column["Name"] for column in self.conn.colMeta], data, strict=True) if self.playbook_mode else data.items()
+                    for key, value in items:
                         if key:
                             self.logger.highlight(f"{key}:{value}")
                         else:
                             self.logger.highlight(f"{value}")
         except Exception as e:
-            self.logger.exception(f"Failed to excuted MSSQL query, reason: {e}")
-            return None
+            error = str(e) or type(e).__name__
+            self.logger.exception(f"Failed to execute MSSQL query, reason: {e}")
+            if not self.playbook_mode:
+                return None
+        if self.playbook_mode:
+            return ActionResult("mssql", "query", self.host, ResultStatus.FAILED if error else ResultStatus.SUCCESS, MSSQLQueryData(self.args.query, [column["Name"] for column in self.conn.colMeta], deepcopy(raw_output)), error=error)
         return raw_output
 
     @requires_admin

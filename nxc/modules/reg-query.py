@@ -1,7 +1,12 @@
-from impacket.dcerpc.v5.rpcrt import DCERPCException
+from dataclasses import dataclass
+from sys import exit
+
 from impacket.dcerpc.v5 import rrp
 from impacket.examples.secretsdump import RemoteOperations
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import RegistryValue
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -10,153 +15,107 @@ class NXCModule:
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
 
-    def __init__(self, context=None, module_options=None):
-        self.context = context
-        self.module_options = module_options
-        self.delete = None
-        self.type = None
-        self.value = None
-        self.key = None
-        self.path = None
+    @dataclass
+    class ResultData:
+        operation: str
+        path: str
+        key: str
+        observed: RegistryValue
+        requested_value: object
+        requested_type: int | None
+        completed: bool
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """
-        PATH    Registry key path to query
-        KEY     Registry key value to retrieve
-        VALUE   Registry key value to set (only used for modification)
-                Will add a new registry key if the registry key does not already exist
-        TYPE    Type of registry to modify, add or delete. Default type : REG_SZ.
-                Type supported: REG_NONE, REG_SZ, REG_EXPAND_SZ,REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_LINK, REG_MULTI_SZ, REG_QWORD
-        DELETE  If set to True, delete a registry key if it does exist
+        PATH    Registry path under HKLM, HKCU, or HKCR (long hive names accepted)
+        KEY     Value name to query, set, or delete (empty for the default value)
+        VALUE   Value to set; creates a missing value in an existing key
+        TYPE    REG_SZ (default), REG_EXPAND_SZ, REG_BINARY, REG_DWORD,
+                REG_DWORD_BIG_ENDIAN, REG_LINK, REG_MULTI_SZ, REG_QWORD, REG_NONE
+        DELETE  Set true to delete the named value; cannot be combined with VALUE
         """
-        self.context = context
-        self.path = None
-        self.key = None
-        self.value = None
+        self.path = module_options.get("PATH")
+        self.key = module_options.get("KEY")
+        self.value = module_options.get("VALUE")
+        self.delete = module_options.get("DELETE", "false").lower() == "true"
+        if not self.path or self.key is None or (self.delete and self.value is not None):
+            context.log.fail("PATH and KEY are required; DELETE and VALUE cannot be combined")
+            exit(1)
         self.type = None
-        self.delete = False
-
-        if module_options and "PATH" in module_options:
-            self.path = module_options["PATH"]
-
-        if module_options and "KEY" in module_options:
-            self.key = module_options["KEY"]
-
-        if "VALUE" in module_options:
-            self.value = module_options["VALUE"]
-            if "TYPE" in module_options:
-                type_dict = {
-                    "REG_NONE": rrp.REG_NONE,
-                    "REG_SZ": rrp.REG_SZ,
-                    "REG_EXPAND_SZ": rrp.REG_EXPAND_SZ,
-                    "REG_BINARY": rrp.REG_BINARY,
-                    "REG_DWORD": rrp.REG_DWORD,
-                    "REG_DWORD_BIG_ENDIAN": rrp.REG_DWORD_BIG_ENDIAN,
-                    "REG_LINK": rrp.REG_LINK,
-                    "REG_MULTI_SZ": rrp.REG_MULTI_SZ,
-                    "REG_QWORD": rrp.REG_QWORD,
-                }
-                self.type = module_options["TYPE"]
-                if "WORD" in self.type:
-                    try:
-                        self.value = int(self.value)
-                    except Exception as e:
-                        context.log.fail(f"Invalid registry value type specified: {self.value}: {e}")
-                        return
-                if self.type in type_dict:
-                    self.type = type_dict[self.type]
-                else:
-                    context.log.fail(f"Invalid registry value type specified: {self.type}")
-                    return
-            else:
-                self.type = 1
-
-        if module_options and "DELETE" in module_options and module_options["DELETE"].lower() == "true":
-            self.delete = True
+        if self.value is not None:
+            types = {name: getattr(rrp, name) for name in ("REG_NONE", "REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_DWORD_BIG_ENDIAN", "REG_LINK", "REG_MULTI_SZ", "REG_QWORD")}
+            name = module_options.get("TYPE", "REG_SZ").upper()
+            if name not in types:
+                context.log.fail(f"Unsupported registry type: {name}")
+                exit(1)
+            self.type = types[name]
+            if "WORD" in name:
+                try:
+                    self.value = int(self.value)
+                except ValueError as e:
+                    context.log.fail(f"Invalid integer registry value: {e}")
+                    exit(1)
 
     def on_admin_login(self, context, connection):
-        self.context = context
-        if not self.path:
-            self.context.log.fail("Please provide the path of the registry to query")
-            return
-        if not self.key:
-            self.context.log.fail("Please provide the registry key to query")
-            return
-
-        remote_ops = RemoteOperations(connection.conn, False)
-        remote_ops.enableRegistry()
-
+        operation = "delete" if self.delete else "set" if self.value is not None else "query"
+        observed = RegistryValue()
+        data = self.ResultData(operation, self.path, self.key, observed, self.value, self.type, False)
+        errors = []
+        remote_ops = None
+        handles = []
         try:
-            if "HKLM" in self.path or "HKEY_LOCAL_MACHINE" in self.path:
-                self.path = self.path.replace("HKLM\\", "")
-                ans = rrp.hOpenLocalMachine(remote_ops._RemoteOperations__rrp)
-            elif "HKCU" in self.path or "HKEY_CURRENT_USER" in self.path:
-                self.path = self.path.replace("HKCU\\", "")
-                ans = rrp.hOpenCurrentUser(remote_ops._RemoteOperations__rrp)
-            elif "HKCR" in self.path or "HKEY_CLASSES_ROOT" in self.path:
-                self.path = self.path.replace("HKCR\\", "")
-                ans = rrp.hOpenClassesRoot(remote_ops._RemoteOperations__rrp)
-            else:
-                self.context.log.fail(f"Unsupported registry hive specified in path: {self.path}")
-                return
-
-            reg_handle = ans["phKey"]
-            ans = rrp.hBaseRegOpenKey(remote_ops._RemoteOperations__rrp, reg_handle, self.path)
-            key_handle = ans["phkResult"]
-
-            if self.delete:
-                # Delete registry
-                try:
-                    # Check if value exists
-                    data_type, reg_value = rrp.hBaseRegQueryValue(remote_ops._RemoteOperations__rrp, key_handle, self.key)
-                except Exception as e:
-                    self.context.log.fail(f"Registry key {self.key} does not exist: {e}")
-                    return
-                # Delete value
-                rrp.hBaseRegDeleteValue(remote_ops._RemoteOperations__rrp, key_handle, self.key)
-                self.context.log.success(f"Registry key {self.key} has been deleted successfully")
-                rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-
-            if self.value is not None:
-                # Check if value exists
-                try:
-                    # Check if value exists
-                    data_type, reg_value = rrp.hBaseRegQueryValue(remote_ops._RemoteOperations__rrp, key_handle, self.key)
-                    self.context.log.highlight(f"Key {self.key} exists with value {reg_value}")
-                    # Modification
-                    rrp.hBaseRegSetValue(
-                        remote_ops._RemoteOperations__rrp,
-                        key_handle,
-                        self.key,
-                        self.type,
-                        self.value,
-                    )
-                    self.context.log.success(f"Key {self.key} has been modified to {self.value}")
-                except Exception:
-                    rrp.hBaseRegSetValue(
-                        remote_ops._RemoteOperations__rrp,
-                        key_handle,
-                        self.key,
-                        self.type,
-                        self.value,
-                    )
-                    self.context.log.success(f"New Key {self.key} has been added with value {self.value}")
-                    rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-            else:
-                # Query
-                try:
-                    data_type, reg_value = rrp.hBaseRegQueryValue(remote_ops._RemoteOperations__rrp, key_handle, self.key)
-                    self.context.log.highlight(f"{self.key}: {reg_value}")
-                except Exception:
-                    if self.delete:
-                        pass
-                    else:
-                        self.context.log.fail(f"Registry key {self.key} does not exist")
-                        return
-            rrp.hBaseRegCloseKey(remote_ops._RemoteOperations__rrp, key_handle)
-        except DCERPCException as e:
-            self.context.log.fail(f"DCERPC Error while querying or modifying registry: {e}")
+            hive, separator, path = self.path.partition("\\")
+            openers = {"HKLM": rrp.hOpenLocalMachine, "HKEY_LOCAL_MACHINE": rrp.hOpenLocalMachine,
+                       "HKCU": rrp.hOpenCurrentUser, "HKEY_CURRENT_USER": rrp.hOpenCurrentUser,
+                       "HKCR": rrp.hOpenClassesRoot, "HKEY_CLASSES_ROOT": rrp.hOpenClassesRoot}
+            if hive.upper() not in openers or not separator:
+                raise ValueError(f"Unsupported registry path: {self.path}")
+            remote_ops = RemoteOperations(connection.conn, False)
+            remote_ops.enableRegistry()
+            rpc = remote_ops._RemoteOperations__rrp
+            root = openers[hive.upper()](rpc)["phKey"]
+            handles.append(root)
+            handle = rrp.hBaseRegOpenKey(rpc, root, path)["phkResult"]
+            handles.append(handle)
+            try:
+                observed.registry_type, observed.value = rrp.hBaseRegQueryValue(rpc, handle, self.key)
+                observed.present = True
+            except rrp.DCERPCSessionError as e:
+                if e.get_error_code() != 2:
+                    raise
+            if operation == "set":
+                rrp.hBaseRegSetValue(rpc, handle, self.key, self.type, self.value)
+                data.completed = True
+                context.log.success(f"Set {self.path}\\{self.key}")
+            elif operation == "delete" and observed.present:
+                rrp.hBaseRegDeleteValue(rpc, handle, self.key)
+                data.completed = True
+                context.log.success(f"Deleted {self.path}\\{self.key}")
+            elif operation == "query" and observed.present:
+                data.completed = True
+                context.log.highlight(f"{self.key}: {observed.value}")
+        except rrp.DCERPCSessionError as e:
+            if e.get_error_code() != 2 or operation == "set":
+                errors.append(str(e) or type(e).__name__)
         except Exception as e:
-            self.context.log.fail(f"Error while querying or modifying registry: {e}")
+            errors.append(str(e) or type(e).__name__)
         finally:
-            remote_ops.finish()
+            for handle in reversed(handles):
+                try:
+                    rrp.hBaseRegCloseKey(rpc, handle)
+                except Exception as e:
+                    errors.append(f"Closing registry handle: {e}")
+            if remote_ops is not None:
+                try:
+                    remote_ops.finish()
+                except Exception as e:
+                    errors.append(f"Finishing registry operation: {e}")
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if data.completed else ResultStatus.NEGATIVE,
+            data, error="; ".join(errors) or None,
+        )

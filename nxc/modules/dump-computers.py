@@ -1,3 +1,7 @@
+from dataclasses import dataclass
+from pathlib import Path
+
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 from nxc.helpers.misc import CATEGORY
 from nxc.parsers.ldap_results import parse_result_attributes
 
@@ -7,6 +11,13 @@ class NXCModule:
     description = "Dumps FQDN and OS of all computers in the domain"
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
+
+    @dataclass
+    class ResultData:
+        computers: list[dict]
+        output_lines: list[str]
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """
@@ -40,6 +51,9 @@ class NXCModule:
         resp_parsed = parse_result_attributes(resp)
 
         answers = []
+        computers = []
+        errors = [connection.last_search_error] if connection.last_search_error else []
+        artifacts = []
         context.log.debug(f"Total number of records returned: {len(resp_parsed)}")
 
         for item in resp_parsed:
@@ -57,6 +71,7 @@ class NXCModule:
             else:
                 answer = f"{dns_host_name} ({operating_system})"
             answers.append(answer)
+            computers.append({"dns_hostname": dns_host_name, "operating_system": item.get("operatingSystem"), "dns_short_name": dns_host_name.split(".")[0]})
 
         context.log.success("Found the following computers:")
         for answer in answers:
@@ -66,6 +81,13 @@ class NXCModule:
             try:
                 with open(self.output_file, "w") as f:
                     f.write("\n".join(answers) + "\n")
+                artifacts.append(Artifact(Path(self.output_file), "computer_list"))
                 context.log.success(f"Results saved to {self.output_file}")
             except Exception as e:
-                context.log.error(f"Failed to write to file {self.output_file}: {e}")
+                errors.append(str(e) or type(e).__name__)
+                context.log.fail(f"Failed to write to file {self.output_file}: {e}")
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if errors else ResultStatus.SUCCESS if computers else ResultStatus.NEGATIVE,
+            self.ResultData(computers, answers), artifacts=artifacts, error="; ".join(errors) or None,
+        )

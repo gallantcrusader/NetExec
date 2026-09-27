@@ -11,18 +11,21 @@ class PassPolDump:
         self.logger = connection.logger
         self.connection = connection
         self.pass_pol = {}
+        self.error = None
 
     def dump(self):
         try:
             dce = NXCRPCConnection(self.connection).connect(r"\samr", samr.MSRPC_UUID_SAMR)
         except Exception as e:
             nxc_logger.debug(f"Failed to connect to SAMR: {e}")
+            self.error = str(e) or type(e).__name__
             return self.pass_pol
 
         try:
             self.fetchList(dce)
         except Exception as e:
             nxc_logger.debug(f"Protocol failed: {e}")
+            self.error = str(e) or type(e).__name__
         else:
             self.pretty_print()
 

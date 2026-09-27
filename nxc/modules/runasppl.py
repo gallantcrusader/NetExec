@@ -1,7 +1,8 @@
-from impacket.dcerpc.v5 import rrp
-from impacket.examples.secretsdump import RemoteOperations
-from impacket.dcerpc.v5.rrp import DCERPCSessionError
+from dataclasses import dataclass
+
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.registry import read_registry_value
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -18,36 +19,25 @@ class NXCModule:
     def options(self, context, module_options):
         """"""
 
+    @dataclass
+    class ResultData:
+        present: bool
+        value: int | None
+        enabled: bool | None
+
+    result_type = ResultData
+
     def on_admin_login(self, context, connection):
-        try:
-            remote_ops = RemoteOperations(connection.conn, False)
-            remote_ops.enableRegistry()
-
-            if remote_ops._RemoteOperations__rrp:
-                ans = rrp.hOpenLocalMachine(remote_ops._RemoteOperations__rrp)
-                reg_handle = ans["phKey"]
-                ans = rrp.hBaseRegOpenKey(
-                    remote_ops._RemoteOperations__rrp,
-                    reg_handle,
-                    "SYSTEM\\CurrentControlSet\\Control\\Lsa"
-                )
-                key_handle = ans["phkResult"]
-                _ = data = None
-                try:
-                    _, data = rrp.hBaseRegQueryValue(
-                        remote_ops._RemoteOperations__rrp,
-                        key_handle,
-                        "RunAsPPL\x00",
-                    )
-                except rrp.DCERPCSessionError as e:
-                    context.log.debug(f"RunAsPPL error {e} on host {connection.host}")
-
-                if data is None or data not in [1, 2]:
-                    context.log.highlight("RunAsPPL disabled")
-                else:
-                    context.log.highlight("RunAsPPL enabled")
-
-        except DCERPCSessionError as e:
-            context.log.debug(f"Error connecting to RemoteRegistry {e} on host {connection.host}")
-        finally:
-            remote_ops.finish()
+        setting = read_registry_value(connection, r"SYSTEM\CurrentControlSet\Control\Lsa", "RunAsPPL")
+        enabled = setting.value in (1, 2) if setting.present else None
+        if setting.error:
+            context.log.fail(setting.error)
+        elif setting.present:
+            context.log.highlight(f"RunAsPPL registry value: {setting.value} (enabled: {enabled})")
+        else:
+            context.log.display("RunAsPPL registry value is absent")
+        return ActionResult(
+            "smb", self.name, connection.host,
+            ResultStatus.FAILED if setting.error else ResultStatus.SUCCESS if enabled else ResultStatus.NEGATIVE,
+            self.ResultData(setting.present, setting.value, enabled), error=setting.error,
+        )

@@ -1,4 +1,9 @@
 import datetime
+from dataclasses import dataclass
+
+from ldap3.utils.conv import escape_filter_chars
+
+from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.helpers.misc import CATEGORY
 from nxc.parsers.ldap_results import parse_result_attributes
 
@@ -14,6 +19,13 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
+    @dataclass
+    class ResultData:
+        username: str
+        users: list[dict]
+
+    result_type = ResultData
+
     def options(self, context, module_options):
         """USER  Enumerate information about a different SamAccountName"""
         self.username = None
@@ -22,13 +34,14 @@ class NXCModule:
 
     def on_login(self, context, connection):
         searchBase = connection.ldap_connection._baseDN
-        searchFilter = f"(sAMAccountName={connection.username})" if self.username is None else f"(sAMAccountName={format(self.username)})"
+        username = connection.username if self.username is None else self.username
+        searchFilter = f"(sAMAccountName={escape_filter_chars(username)})"
 
         context.log.debug(f"Using naming context: {searchBase} and {searchFilter} as search filter")
 
         # Get attributes of provided user
-        r = connection.ldap_connection.search(
-            searchBase=searchBase,
+        r = connection.search(
+            baseDN=searchBase,
             searchFilter=searchFilter,
             attributes=[
                 "name",
@@ -46,7 +59,7 @@ class NXCModule:
                 "badPwdCount",
                 "memberOf",
             ],
-            sizeLimit=999,
+            sizeLimit=0,
         )
         resp_parsed = parse_result_attributes(r)
 
@@ -132,3 +145,10 @@ class NXCModule:
             # Process User Sid
             if "objectSid" in response:
                 context.log.highlight(f"User SID: {response['objectSid']}")
+
+        error = connection.last_search_error
+        return ActionResult(
+            "ldap", self.name, connection.host,
+            ResultStatus.FAILED if error else ResultStatus.SUCCESS if resp_parsed else ResultStatus.NEGATIVE,
+            self.ResultData(username, resp_parsed), error=error,
+        )

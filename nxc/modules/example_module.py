@@ -1,53 +1,45 @@
+from dataclasses import dataclass, field
+
 from nxc.helpers.misc import CATEGORY
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
-    """
-    Example:
-    -------
-    Module by @yomama
-    """
+    """Copy this module to start a custom module with structured results."""
 
-    name = "example module"
-    description = "I do something"
-    supported_protocols = []  # Example: ['smb', 'mssql']
-    category = CATEGORY.ENUMERATION  # Must be one of "Enumeration", "Privilege Escalation" or "Credential Dumping". Use what fits best.
+    name = "example_module"
+    description = "Example structured module (no remote operation)"
+    supported_protocols = ["smb"]  # List the protocols your implementation supports.
+    category = CATEGORY.ENUMERATION
 
-    def __init__(self):
-        self.context = None
-        self.module_options = None
+    @dataclass
+    class ResultData:
+        records: list[dict] = field(default_factory=list)
+        reason: str | None = None
+
+    result_type = ResultData
 
     def options(self, context, module_options):
-        """Required.
-        Module options get parsed here. Additionally, put the modules usage here as well
-        """
-        # Put "No options available" in the docstring if there are no options for the module
-        # Return False to abort the run if options are invalid (log with context.log.fail first).
+        """No options available."""
+        # Parse options here. For invalid required options, log the reason and
+        # call exit(1) imported from sys; the playbook captures that failure.
 
     def on_login(self, context, connection):
-        """Concurrent.
-        Required if on_admin_login is not present. This gets called on each authenticated connection
-        """
-        # Logging best practice
-        # Mostly you should use these functions to display information to the user
-        context.log.display("I'm doing something")  # Use this for every normal message ([*] I'm doing something)
-        context.log.success("I'm doing something")  # Use this for when something succeeds ([+] I'm doing something)
-        context.log.fail("I'm doing something")  # Use this for when something fails ([-] I'm doing something), for example a remote registry entry is missing which is needed to proceed
-        context.log.highlight("I'm doing something")  # Use this for when something is important and should be highlighted, printing credentials for example
+        """Use on_admin_login instead when the operation requires admin rights."""
+        # Use the supplied connection. In a playbook, context.session provides
+        # its ProtocolSession and context.playbook provides the HostContext.
+        # context.credential is the successful login's database reference, when
+        # one exists. Reuse it for another protocol via context.playbook.
+        # Return observed values in data; logs are for human-readable messages.
+        reason = "Example module has no remote operation; replace this hook with your implementation"
+        context.log.display(reason)
+        return ActionResult(
+            connection.args.protocol, self.name, connection.host,
+            ResultStatus.SKIPPED, self.ResultData(reason=reason),
+        )
 
-        # These are for debugging purposes
-        context.log.info("I'm doing something")  # This will only be displayed if the user has specified the --verbose flag, so add additional info that might be useful
-        context.log.debug("I'm doing something")  # This will only be displayed if the user has specified the --debug flag, so add info that you would might need for debugging errors
-
-        # These are for more critical error handling
-        context.log.error("I'm doing something")  # This will not be printed in the module context and should only be used for critical errors (e.g. a required python file is missing)
-        try:
-            raise Exception("Exception that might have occurred")
-        except Exception as e:
-            context.log.exception(f"Exception occurred: {e}")  # This will display an exception traceback screen after an exception was raised and should only be used for critical errors
-
-    def on_admin_login(self, context, connection):
-        """Concurrent.
-        Required if on_login is not present
-        This gets called on each authenticated connection with  Administrative privileges
-        """
+        # A real operation should return SUCCESS when its success condition is
+        # met, NEGATIVE for a completed negative observation, or FAILED with an
+        # error string when it cannot complete. Preserve partial records and
+        # add Artifact(path, kind) for output files. Each executed hook must
+        # return the declared data type, including early-return/error paths.

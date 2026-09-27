@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from dploot.lib.target import Target
 from nxc.helpers.misc import CATEGORY
 from nxc.helpers.firefox import FirefoxCookie, FirefoxData, FirefoxTriage
@@ -14,6 +15,7 @@ class NXCModule:
     description = "[REMOVED] Dump credentials from Firefox"
     supported_protocols = ["smb"]
     category = CATEGORY.CREDENTIAL_DUMPING
+    result_type = RetiredModuleData
 
     def options(self, context, module_options):
         """
@@ -25,7 +27,7 @@ class NXCModule:
 
     def on_admin_login(self, context, connection):
         context.log.fail("[REMOVED] Use the --dpapi flag instead of the module firefox.")
-        return
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("action:dpapi"), error="[REMOVED] Use the --dpapi flag instead of the module firefox.")
 
         host = connection.host if not connection.kerberos else connection.hostname + "." + connection.domain
         domain = connection.domain

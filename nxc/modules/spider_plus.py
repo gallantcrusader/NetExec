@@ -1,11 +1,13 @@
 import json
 import errno
+from dataclasses import asdict, dataclass
 from os.path import abspath, join, exists, splitext, getsize
 from os import makedirs, remove, stat
 from pathlib import Path, PurePosixPath
 import time
 from nxc.helpers.misc import CATEGORY
 from nxc.paths import NXC_PATH
+from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 from nxc.protocols.smb.remotefile import RemoteFile
 from impacket.smb3structs import FILE_READ_DATA
 from impacket.smbconnection import SessionError
@@ -70,6 +72,7 @@ class SMBSpiderPlus:
         self.max_connection_attempts = 5
         self.logger = logger
         self.results = {}
+        self.downloaded_paths = []
         self.stats = {
             "shares": [],
             "shares_readable": [],
@@ -186,6 +189,8 @@ class SMBSpiderPlus:
         """Enumerates all available shares for the SMB connection, spiders through the readable shares, and saves the metadata of the shares to a JSON file"""
         self.logger.info("Enumerating shares for spidering.")
         shares = self.smb.shares()
+        if isinstance(shares, ActionResult):
+            shares = [asdict(share) for share in shares.data.shares]
 
         try:
             # Get all available shares for the SMB connection
@@ -336,6 +341,7 @@ class SMBSpiderPlus:
         # Increment stats counters
         if download_success:
             self.stats["num_get_success"] += 1
+            self.downloaded_paths.append(download_path)
             if needs_update_flag:
                 self.stats["num_files_updated"] += 1
         else:
@@ -465,12 +471,19 @@ class SMBSpiderPlus:
 
 
 class NXCModule:
-    """Spider Plus Nodule
+    """Spider Plus module by @vincd, updated by @godylockz."""
 
-    Module by @vincd
-    Updated by @godylockz
-    """
+    @dataclass
+    class ResultData:
+        files: dict[str, dict[str, dict[str, str]]]
+        shares: list[str]
+        readable_shares: list[str]
+        downloaded_files: list[str]
+        download_count: int
+        download_failures: int
+        output_folder: str
 
+    result_type = ResultData
     name = "spider_plus"
     description = "List files recursively and save a JSON share-file metadata to the 'OUTPUT_FOLDER'. See module options for finer configuration."
     supported_protocols = ["smb"]
@@ -488,12 +501,8 @@ class NXCModule:
         MAX_FILE_SIZE     Max file size to download (Default: 51200)
         OUTPUT_FOLDER     Path of the local folder to save files (Default: NXC_PATH/nxc_spider_plus)
         """
-        self.download_flag = False
-        if any("DOWNLOAD" in key for key in module_options):
-            self.download_flag = True
-        self.stats_flag = True
-        if any("STATS" in key for key in module_options):
-            self.stats_flag = False
+        self.download_flag = module_options.get("DOWNLOAD_FLAG", "false").lower() in ("true", "1", "yes")
+        self.stats_flag = module_options.get("STATS_FLAG", "true").lower() in ("true", "1", "yes")
         self.exclude_exts = get_list_from_option(module_options.get("EXCLUDE_EXTS", "ico,lnk"))
         self.exclude_exts = [d.lower() for d in self.exclude_exts]  # force case-insensitive
         self.exclude_filter = get_list_from_option(module_options.get("EXCLUDE_FILTER", "print$,ipc$"))
@@ -521,4 +530,23 @@ class NXCModule:
             self.output_folder,
         )
 
-        spider.spider_shares()
+        files = spider.spider_shares()
+        metadata_path = Path(self.output_folder) / f"{spider.host}.json"
+        artifacts = [Artifact(metadata_path, "share_metadata")]
+        artifacts.extend(Artifact(Path(path), "downloaded_file") for path in spider.downloaded_paths)
+        return ActionResult(
+            protocol="smb",
+            action=self.name,
+            target=connection.host,
+            status=ResultStatus.SUCCESS if spider.stats["num_get_fail"] == 0 else ResultStatus.FAILED,
+            data=self.ResultData(
+                files=files,
+                shares=spider.stats["shares"],
+                readable_shares=spider.stats["shares_readable"],
+                downloaded_files=spider.downloaded_paths,
+                download_count=spider.stats["num_get_success"],
+                download_failures=spider.stats["num_get_fail"],
+                output_folder=self.output_folder,
+            ),
+            artifacts=artifacts,
+        )

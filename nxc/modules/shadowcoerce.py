@@ -1,3 +1,4 @@
+from nxc.playbooks.results import ActionResult, ResultStatus, RetiredModuleData
 from nxc.helpers.misc import CATEGORY
 
 
@@ -6,6 +7,7 @@ class NXCModule:
     description = "[REMOVED] Module to check if the target is vulnerable to ShadowCoerce, credit to @Shutdown and @topotam"
     supported_protocols = ["smb"]
     category = CATEGORY.ENUMERATION
+    result_type = RetiredModuleData
 
     def options(self, context, module_options):
         """
@@ -22,3 +24,4 @@ class NXCModule:
 
     def on_login(self, context, connection):
         context.log.fail('[REMOVED] This module moved to the new module "coerce_plus"')
+        return ActionResult(connection.args.protocol, self.name, connection.host, ResultStatus.FAILED, RetiredModuleData("module:coerce_plus"), error='[REMOVED] This module moved to the new module "coerce_plus"')
