@@ -41,13 +41,13 @@ def test_connection_defaults_and_overrides(monkeypatch, protocol, options, domai
 def test_cli_domain_and_dns_defaults(tmp_path):
     script = tmp_path / "defaults.py"
     script.write_text("def run(host):\n    assert host.connection_defaults == {'domain': 'north.example', 'dns_server': '192.0.2.10'}\n")
-    assert runner.main([str(script), "192.0.2.11", "-d", "north.example", "--dns-server", "192.0.2.10", "--results", str(tmp_path / "results.json")]) == 0
+    assert runner.main(["192.0.2.11", str(script), "-d", "north.example", "--dns-server", "192.0.2.10", "--results", str(tmp_path / "results.json")]) == 0
 
 
 def test_cli_kerberos_defaults_reach_playbook(tmp_path):
     script = tmp_path / "kerberos.py"
     script.write_text("def run(host):\n    assert host.connection_defaults == {'domain': 'north.example', 'kerberos': True, 'kdcHost': '192.0.2.10'}\n")
-    assert runner.main([str(script), "192.0.2.11", "-d", "north.example", "-k", "--kdcHost", "192.0.2.10", "--results", str(tmp_path / "results.json")]) == 0
+    assert runner.main(["192.0.2.11", str(script), "-d", "north.example", "-k", "--kdcHost", "192.0.2.10", "--results", str(tmp_path / "results.json")]) == 0
 
 
 def test_kerberos_default_applies_to_ldap_connection(monkeypatch):

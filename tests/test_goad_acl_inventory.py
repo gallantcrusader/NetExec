@@ -11,7 +11,7 @@ from nxc.playbooks.results import ActionResult, ResultStatus
 from nxc.playbooks.runner import load_playbook
 
 
-SCRIPT = Path(__file__).parents[1] / "examples" / "playbooks" / "goad_acl_inventory.py"
+SCRIPT = Path(__file__).parents[1] / "examples" / "playbooks" / "verify" / "goad_acl_inventory.py"
 MANIFEST = SCRIPT.with_name("goad_acl_manifest.json")
 
 

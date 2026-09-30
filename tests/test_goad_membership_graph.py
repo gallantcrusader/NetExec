@@ -9,7 +9,7 @@ import pytest
 from nxc.playbooks.runner import load_playbook
 
 
-ROOT = Path(__file__).parents[1] / "examples" / "playbooks"
+ROOT = Path(__file__).parents[1] / "examples" / "playbooks" / "verify"
 
 
 def inventory(path, domain, target, edges, digest="same"):

@@ -610,8 +610,8 @@ def run_host(target, playbook, shared_args, connection_defaults=None, allowed_ta
 def main(argv=None):
     """Entry point for ``nxc playbook``."""
     parser = argparse.ArgumentParser(prog="nxc playbook", description="Run one Python playbook per target")
-    parser.add_argument("script", help="Python file defining run(host)")
     parser.add_argument("target", nargs="+", help="NetExec target(s) or target file(s)")
+    parser.add_argument("script", help="Python file defining run(host)")
     parser.add_argument("--allow-target", nargs="+", action="extend", default=[], help="Additional target(s) available through host.at(), without starting additional workflows")
     parser.add_argument("-u", "--username", nargs="+", default=[])
     parser.add_argument("-p", "--password", nargs="+", default=[])

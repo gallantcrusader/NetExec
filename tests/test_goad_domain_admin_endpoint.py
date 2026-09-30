@@ -10,7 +10,7 @@ from nxc.playbooks.results import ActionResult, CredentialRef, ResultStatus
 from nxc.playbooks.runner import load_playbook
 
 
-SCRIPT = Path(__file__).parents[1] / "examples" / "playbooks" / "goad_domain_admin_endpoint.py"
+SCRIPT = Path(__file__).parents[1] / "examples" / "playbooks" / "verify" / "goad_domain_admin_endpoint.py"
 
 
 @pytest.mark.parametrize(("computed_sid", "smb_admin", "expected_reached", "smb_calls"), [

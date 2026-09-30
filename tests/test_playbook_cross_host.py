@@ -97,7 +97,7 @@ def test_cli_extra_scope_does_not_start_extra_workflows_and_saves_partial_result
         encoding="utf-8",
     )
     output = tmp_path / "results.json"
-    assert runner.main([str(script), "192.0.2.1", "--allow-target", "192.0.2.2", "--results", str(output)]) == 1
+    assert runner.main(["192.0.2.1", str(script), "--allow-target", "192.0.2.2", "--results", str(output)]) == 1
     hosts = json.loads(output.read_text())["hosts"]
     assert len(hosts) == 1
     assert hosts[0]["allowed_targets"] == ["192.0.2.1", "192.0.2.2"]
@@ -111,7 +111,7 @@ def test_extra_targets_obey_exclusions_and_files(tmp_path):
     scope = tmp_path / "scope.txt"
     scope.write_text("192.0.2.2\n192.0.2.3\n", encoding="utf-8")
     output = tmp_path / "results.json"
-    assert runner.main([str(script), "192.0.2.1", "--allow-target", str(scope), "--exclude-hosts", "192.0.2.2", "--results", str(output)]) == 1
+    assert runner.main(["192.0.2.1", str(script), "--allow-target", str(scope), "--exclude-hosts", "192.0.2.2", "--results", str(output)]) == 1
     run = json.loads(output.read_text())["hosts"][0]
     assert run["allowed_targets"] == ["192.0.2.1", "192.0.2.3"]
     assert "outside" in run["error"]
@@ -138,5 +138,5 @@ def test_custom_writer_receives_cross_host_results(tmp_path):
         encoding="utf-8",
     )
     output = tmp_path / "result.txt"
-    assert runner.main([str(script), "192.0.2.1", "--allow-target", "192.0.2.2", "--results", str(output)]) == 0
+    assert runner.main(["192.0.2.1", str(script), "--allow-target", "192.0.2.2", "--results", str(output)]) == 0
     assert output.read_text() == "192.0.2.2"

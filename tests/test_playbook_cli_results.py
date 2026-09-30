@@ -25,7 +25,7 @@ def test_cli_exit_code_reflects_continued_failures(tmp_path, status, expected_co
         encoding="utf-8",
     )
     output = tmp_path / "results.json"
-    code = runner.main([str(script), "192.0.2.1", "192.0.2.2", "--results", str(output)])
+    code = runner.main(["192.0.2.1", "192.0.2.2", str(script), "--results", str(output)])
     assert code == expected_code
     hosts = json.loads(output.read_text())["hosts"]
     assert [host["target"] for host in hosts] == ["192.0.2.1", "192.0.2.2"]
@@ -38,7 +38,7 @@ def test_invalid_writer_is_rejected_before_running_hosts(tmp_path, monkeypatch):
     run_host = Mock()
     monkeypatch.setattr(runner, "run_host", run_host)
     with pytest.raises(ValueError, match="save_results must be a function"):
-        runner.main([str(script), "192.0.2.1", "--results", str(tmp_path / "results.json")])
+        runner.main(["192.0.2.1", str(script), "--results", str(tmp_path / "results.json")])
     run_host.assert_not_called()
 
 
@@ -46,7 +46,7 @@ def test_one_host_exception_does_not_prevent_saving_other_hosts(tmp_path):
     script = tmp_path / "mixed.py"
     script.write_text("def run(host):\n    if host.target == '192.0.2.1':\n        raise RuntimeError('local failure')\n", encoding="utf-8")
     output = tmp_path / "results.json"
-    assert runner.main([str(script), "192.0.2.1", "192.0.2.2", "--results", str(output)]) == 1
+    assert runner.main(["192.0.2.1", "192.0.2.2", str(script), "--results", str(output)]) == 1
     hosts = json.loads(output.read_text())["hosts"]
     assert hosts[0]["error"] == "local failure"
     assert hosts[1]["status"] == "success"
@@ -65,5 +65,5 @@ def test_invalid_callback_is_rejected_before_running_hosts(tmp_path, monkeypatch
     run_host = Mock()
     monkeypatch.setattr(runner, "run_host", run_host)
     with pytest.raises(ValueError, match="must"):
-        runner.main([str(script), "192.0.2.1", "--results", str(tmp_path / "results.json")])
+        runner.main(["192.0.2.1", str(script), "--results", str(tmp_path / "results.json")])
     run_host.assert_not_called()

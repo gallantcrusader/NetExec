@@ -226,7 +226,7 @@ def test_playbook_can_save_results_in_its_own_format():
             encoding="utf-8",
         )
 
-        code = playbook_runner.main([str(path), "offline.invalid", "--results", str(output)])
+        code = playbook_runner.main(["offline.invalid", str(path), "--results", str(output)])
 
         assert code == 0
         assert output.read_text(encoding="utf-8") == "offline.invalid"

@@ -1,5 +1,24 @@
 # Python playbooks
 
+Examples live in [`examples/playbooks/`](../examples/playbooks/README.md): small
+single-concept files under `teaching/<protocol>/`, full attack chains under
+`chains/` (each with a one-page cookbook in [`docs/cookbooks/`](cookbooks)),
+reconciliation playbooks under `verify/`, and smoke tests under `smoke/`.
+
+Ergonomic helpers a playbook author reaches for most:
+
+- `session.authenticated` / `session.credential` / `session.admin` — one-hop
+  reads instead of `session.result.data.authenticated` etc. (safe on failed sessions).
+- `result.rows` (list of dict rows) and `result.one()` (the single row, else raises)
+  for query-style actions (`mssql`/`ldap` query, `wmi`).
+- `host.defaults(stop_on_error=False)` sets a workflow-wide step default; an explicit
+  per-call `stop_on_error=` always wins.
+- `with host.evidence() as ev:` auto-collects the `host.run.results` indices recorded
+  inside the block (`ev.indices`); every recorded step also carries `result.index`.
+- `host.finding(name, ok=..., data=..., inputs=...)` records a playbook-level verdict.
+- `session.module(...)` always returns a `ModuleResult` — iterable over the individual
+  results, and single-result attribute access (`.status`/`.data`/`.rows`/...) proxies through.
+
 The playbook API is under development. Every CLI action and module can return a serializable baseline result. Selected SMB and LDAP actions and the `install_elevated`, `uac`, `runasppl`, `get-info-users`, `groupmembership`, `maq`, `subnets`, `get-desc-users`, `spider_plus`, `spooler`, `webdav`, `enum_ca`, `smbghost`, and `ms17-010` modules provide richer, action-specific data. Other actions and modules use `kind="captured"` with structured log events and their return value; their messages are not yet parsed into action-specific fields.
 
 Install the project's locked dependencies and development tools with `uv sync --frozen --group dev --python 3.13`. The frozen option keeps the existing Git dependency revisions from `uv.lock` without rewriting the lockfile.
@@ -7,7 +26,7 @@ Install the project's locked dependencies and development tools with `uv sync --
 Run a Python file that defines `run(host)`:
 
 ```shell
-nxc playbook examples/playbooks/recon.py targets.txt -u user -p password
+nxc playbook targets.txt examples/playbooks/smoke/recon.py -u user -p password
 ```
 
 Use `-d DOMAIN` and `--dns-server ADDRESS` to set connection defaults across a
@@ -66,7 +85,7 @@ def run(host):
 ```
 
 ```shell
-nxc playbook path.py 10.60.0.11 --allow-target 10.60.0.22 -u user -p password
+nxc playbook 10.60.0.11 path.py --allow-target 10.60.0.22 -u user -p password
 ```
 
 Positional targets start independent `run(host)` calls. `--allow-target` adds
@@ -88,13 +107,13 @@ code, and individual operations such as SQL linked-server execution can contact
 their own destinations. Declare and check those destinations in the playbook
 before issuing such operations.
 
-`examples/playbooks/goad_cross_host_sql.py` follows a stored LDAP credential from
+`examples/playbooks/chains/goad_cross_host_sql.py` follows a stored LDAP credential from
 Winterfell to Castelblack and checks the configured Braavos SQL link using SELECT
 queries. Its summary retains source/SQL credential references, identity evidence,
 and zero-based indices into the root result list. `reached=true` means the observed
 SQL sysadmin endpoint was reached; it does not imply Windows or domain control.
 
-`examples/playbooks/goad_laps_path.py` reads Braavos's LAPS value as an Essos
+`examples/playbooks/chains/goad_laps_path.py` reads Braavos's LAPS value as an Essos
 reader, authenticates to Braavos SMB as its local Administrator, then logs in
 again through the stored SMB credential reference. It records both admin-check
 results, read-only share permissions, the CA publication in AD, and the CA RPC
@@ -1121,7 +1140,7 @@ Only observed edges enter the graph; source mismatches remain in `unresolved`.
 Admin users against AD's computed `tokenGroups` on each DC.
 
 ```sh
-nxc playbook examples/playbooks/goad_group_inventory.py 10.60.0.12 -u jorah.mormont -p 'H0nnor!' -d essos.local --dns-server 10.60.0.12
+nxc playbook 10.60.0.12 examples/playbooks/verify/goad_group_inventory.py -u jorah.mormont -p 'H0nnor!' -d essos.local --dns-server 10.60.0.12
 ```
 
 `goad_local_group_inventory.py` checks the source-configured Administrators and
