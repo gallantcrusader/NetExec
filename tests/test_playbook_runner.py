@@ -189,7 +189,7 @@ def test_unknown_module_is_recorded_as_failed_step():
     assert result.status is ResultStatus.FAILED
     assert result.inputs == {"sample": True}
     assert "Unknown module" in result.error
-    assert host.run.results == [result]
+    assert host.run.results == result.results
 
 
 def test_credential_resolution_failure_is_recorded_before_connection(monkeypatch):

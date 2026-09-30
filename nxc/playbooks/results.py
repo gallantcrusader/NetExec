@@ -108,14 +108,151 @@ class ActionResult(Generic[Data]):
     kind: str = "typed"
     events: list[OutputEvent] = field(default_factory=list)
     hook: str | None = None
+    index: int | None = None
 
     @property
     def ok(self) -> bool:
         return self.status is ResultStatus.SUCCESS
 
+    @property
+    def rows(self) -> list[dict]:
+        """Tabular payload as a list of dict rows, one dict per row.
+
+        Works for query-style actions regardless of how the protocol stores the
+        payload: ``columns`` + positional ``rows`` (mssql), ``attributes`` +
+        ``entries`` (ldap), ``records`` (wmi), or a ``rows`` list that is already
+        dict-like. Duplicate column names collapse (last value wins); use
+        ``self.data`` directly when positional fidelity matters.
+        """
+        return tabular_rows(self.data)
+
+    def one(self) -> dict:
+        """Return the single tabular row as a dict, or raise if there is not exactly one."""
+        rows = self.rows
+        if len(rows) != 1:
+            raise ValueError(f"{self.protocol}.{self.action} returned {len(rows)} rows; expected exactly one")
+        return rows[0]
+
     def to_dict(self) -> dict[str, Any]:
         """Convert a result to JSON-compatible values without losing binary data."""
         return json_value(self)
+
+
+def tabular_rows(data: Any) -> list[dict]:
+    """Adapt a typed action payload to a uniform list of dict rows.
+
+    Recognizes the tabular shapes NetExec actions use: ``attributes``/``entries``
+    (ldap), ``records`` (wmi), and ``columns``/``rows`` (mssql). A bare ``rows``
+    list whose elements are already mappings is returned as dicts. Raises
+    ``TypeError`` for payloads that are not tabular.
+    """
+    entries = getattr(data, "entries", None)
+    if isinstance(entries, list):
+        return [dict(entry) for entry in entries]
+    records = getattr(data, "records", None)
+    if isinstance(records, list):
+        return [dict(record) for record in records]
+    rows = getattr(data, "rows", None)
+    if isinstance(rows, list):
+        columns = getattr(data, "columns", None)
+        if columns is not None:
+            columns = list(columns)
+            return [dict(zip(columns, row, strict=False)) for row in rows]
+        return [dict(row) for row in rows]
+    raise TypeError(f"{type(data).__name__} has no tabular rows (expected columns/rows, attributes/entries, or records)")
+
+
+class ModuleResult:
+    """Uniform container for the one-or-more results a module run produces.
+
+    A module hook may emit several :class:`ActionResult` objects (one per host
+    hook). This container is always what ``session.module(...)`` returns so a
+    caller never has to branch on "single vs list". It is iterable and indexable
+    over the individual results, and single-result attribute access
+    (``status``/``data``/``error``/``rows``/``one()``/``index``/...) transparently
+    proxies to the sole result, raising a clear error if there is more than one.
+    """
+
+    def __init__(self, results):
+        self.results = list(results)
+
+    def __iter__(self):
+        return iter(self.results)
+
+    def __len__(self):
+        return len(self.results)
+
+    def __getitem__(self, item):
+        return self.results[item]
+
+    def __bool__(self):
+        return bool(self.results)
+
+    @property
+    def first(self) -> "ActionResult | None":
+        return self.results[0] if self.results else None
+
+    @property
+    def ok(self) -> bool:
+        """True when the module produced results and every one succeeded."""
+        return bool(self.results) and all(result.ok for result in self.results)
+
+    def _single(self) -> "ActionResult":
+        if len(self.results) != 1:
+            raise ValueError(f"module produced {len(self.results)} results; iterate the results instead of reading a single value")
+        return self.results[0]
+
+    @property
+    def error(self) -> str | None:
+        """First failure message across the produced results, if any."""
+        for result in self.results:
+            if result.error:
+                return result.error
+        return None
+
+    @property
+    def events(self) -> list[OutputEvent]:
+        collected: list[OutputEvent] = []
+        for result in self.results:
+            collected.extend(result.events)
+        return collected
+
+    @property
+    def status(self) -> ResultStatus:
+        return self._single().status
+
+    @property
+    def data(self) -> Any:
+        return self._single().data
+
+    @property
+    def inputs(self) -> dict:
+        return self._single().inputs
+
+    @property
+    def artifacts(self) -> list[Artifact]:
+        collected: list[Artifact] = []
+        for result in self.results:
+            collected.extend(result.artifacts)
+        return collected
+
+    @property
+    def hook(self) -> str | None:
+        return self._single().hook
+
+    @property
+    def index(self) -> int | None:
+        return self._single().index
+
+    @property
+    def rows(self) -> list[dict]:
+        return self._single().rows
+
+    def one(self) -> dict:
+        return self._single().one()
+
+    def to_dict(self) -> list[dict]:
+        return [result.to_dict() for result in self.results]
 
 
 def json_value(value: Any) -> Any:

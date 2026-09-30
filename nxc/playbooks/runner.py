@@ -24,12 +24,17 @@ from nxc.parsers.ip import process_targets
 from nxc.paths import NXC_PATH, WORKSPACE_DIR
 from nxc.playbooks.capture import RecordingLogger, captured_result
 from nxc.playbooks.contracts import ResultContractError, validate_action_result
-from nxc.playbooks.results import ActionResult, CredentialRef, OutputEvent, ResultStatus, json_value
+from nxc.playbooks.results import ActionResult, CredentialRef, ModuleResult, OutputEvent, ResultStatus, json_value
 
 
 class PlaybookStepError(RuntimeError):
     """Stop work on one host after an unhandled step failure."""
 
+
+# Sentinel for step options that fall back to the host-level default when the
+# caller does not pass them. An explicit value on a call always wins over the
+# host default set with host.defaults(...).
+_UNSET = object()
 
 MULTI_VALUE_OPTIONS = {"username", "password", "hash", "aesKey", "cred_id"}
 RESERVED_CONNECTION_OPTIONS = {"protocol", "target", "module", "module_options", "playbook_mode"}
@@ -56,6 +61,22 @@ class FailureData:
 @dataclass
 class SkippedData:
     reason: str
+
+
+@dataclass
+class VerdictData:
+    """Default payload for a host.finding(...) verdict when no custom data is given."""
+
+    finding: str
+    ok: bool
+    detail: str | None = None
+
+
+class _EvidenceCollector:
+    """Collects the host.run.results indices recorded within a host.evidence() block."""
+
+    def __init__(self):
+        self.indices = []
 
 
 def format_module_option(value):
@@ -114,6 +135,8 @@ class WorkflowState:
     run: HostRun
     allowed_targets: tuple[str, ...]
     hosts: dict[str, "HostContext"] = field(default_factory=dict)
+    step_defaults: dict = field(default_factory=dict)
+    evidence_stack: list = field(default_factory=list)
 
 
 class ProtocolSession:
@@ -134,8 +157,30 @@ class ProtocolSession:
     def ok(self):
         return self.result.ok and not getattr(self.connection, "playbook_unusable_reason", None)
 
-    def action(self, name, *, stop_on_error=True, **options):
+    @property
+    def authenticated(self):
+        """True when a real (non-anonymous, non-guest) login succeeded on this session."""
+        return self.ok and isinstance(self.result.data, ConnectionData) and bool(self.result.data.authenticated)
+
+    @property
+    def credential(self):
+        """The stored credential reference for this login, or None (reusable via credential=)."""
+        return self.result.data.credential if isinstance(self.result.data, ConnectionData) else None
+
+    @property
+    def admin(self):
+        """Local-admin state on the target: True/False, or None when unknown or unchecked."""
+        return self.result.data.admin_privileges if isinstance(self.result.data, ConnectionData) else None
+
+    def _stop(self, stop_on_error):
+        """Resolve a per-call stop_on_error against the host default (explicit wins)."""
+        if stop_on_error is _UNSET:
+            return self.host.step_defaults.get("stop_on_error", True)
+        return stop_on_error
+
+    def action(self, name, *, stop_on_error=_UNSET, **options):
         """Run one CLI action on this connection and record its output."""
+        stop_on_error = self._stop(stop_on_error)
         original_logger = getattr(self.connection, "logger", None)
         recorder = RecordingLogger(original_logger) if original_logger is not None else None
         try:
@@ -179,12 +224,13 @@ class ProtocolSession:
             result.inputs = options.copy()
         return self.host.record(result, stop_on_error)
 
-    def module(self, name, *, stop_on_error=True, **options):
-        """Run a module on this connection with structured results."""
+    def module(self, name, *, stop_on_error=_UNSET, **options):
+        """Run a module on this connection and return its results as a ModuleResult."""
+        stop_on_error = self._stop(stop_on_error)
         if not self.ok:
             message = f"No open {self.protocol} session for {self.host.target}"
             result = ActionResult(self.protocol, name, self.host.target, ResultStatus.FAILED, FailureData(message), error=message, inputs=options.copy())
-            return self.host.record(result, stop_on_error)
+            return ModuleResult([self.host.record(result, stop_on_error)])
         old_module = self.args.module
         old_options = self.args.module_options
         old_modules = getattr(self.connection, "modules", None)
@@ -229,7 +275,7 @@ class ProtocolSession:
             for result in results:
                 if result.status is ResultStatus.FAILED:
                     raise PlaybookStepError(result.error or f"{self.protocol}.{name} failed")
-        return results[0] if len(results) == 1 else results
+        return ModuleResult(results)
 
     def __getattr__(self, name):
         if name in vars(self.args) and callable(getattr(self.connection, name, None)):
@@ -260,6 +306,25 @@ class HostContext:
         self.loader = ProtocolLoader()
         self.protocols = self.loader.get_protocols()
 
+    @property
+    def step_defaults(self):
+        """Workflow-wide default step options (e.g. stop_on_error) shared across at() peers."""
+        return self.workflow.step_defaults
+
+    def defaults(self, **options):
+        """Set default step options for this workflow; an explicit value on a call always wins.
+
+        Currently honours ``stop_on_error``. Example: ``host.defaults(stop_on_error=False)``
+        makes probe-style playbooks continue past failures without repeating the flag,
+        while any individual ``session.action(..., stop_on_error=True)`` still overrides it.
+        """
+        self.workflow.step_defaults.update(options)
+        return self
+
+    def step_default(self, name, fallback=None):
+        """Return the workflow default for a step option, or ``fallback`` if unset."""
+        return self.workflow.step_defaults.get(name, fallback)
+
     def at(self, target):
         """Select an explicitly allowed target, keeping this workflow's results."""
         if target not in self.workflow.allowed_targets:
@@ -268,11 +333,46 @@ class HostContext:
             HostContext(target, self.shared_args, self.connection_defaults, workflow=self.workflow)
         return self.workflow.hosts[target]
 
-    def record(self, result, stop_on_error=True):
+    def record(self, result, stop_on_error=_UNSET):
+        if stop_on_error is _UNSET:
+            stop_on_error = self.workflow.step_defaults.get("stop_on_error", True)
+        result.index = len(self.run.results)
         self.run.results.append(result)
+        for collector in self.workflow.evidence_stack:
+            collector.indices.append(result.index)
         if result.status is ResultStatus.FAILED and stop_on_error:
             raise PlaybookStepError(result.error or f"{result.protocol}.{result.action} failed")
         return result
+
+    @contextlib.contextmanager
+    def evidence(self):
+        """Collect the run-result indices recorded inside this block.
+
+        Removes the need to hand-track ``len(host.run.results) - 1`` after each
+        step. The yielded object exposes ``.indices`` (a list of ints into
+        ``host.run.results``), populated for every result recorded across this and
+        any ``host.at()`` peer while the block is active.
+        """
+        collector = _EvidenceCollector()
+        self.workflow.evidence_stack.append(collector)
+        try:
+            yield collector
+        finally:
+            self.workflow.evidence_stack.remove(collector)
+
+    def finding(self, name, *, ok=None, status=None, data=None, inputs=None, protocol="playbook", error=None):
+        """Record a playbook-level verdict as an ActionResult and return it.
+
+        Pass ``ok=True/False`` for the common SUCCESS/NEGATIVE verdict, or an explicit
+        ``status=ResultStatus.…``. Supply your own dataclass as ``data`` to carry
+        evidence; when omitted a small VerdictData payload is stored.
+        """
+        if status is None:
+            status = ResultStatus.SUCCESS if ok else ResultStatus.NEGATIVE
+        if data is None:
+            data = VerdictData(name, status is ResultStatus.SUCCESS, error)
+        result = ActionResult(protocol, name, self.target, status, data, inputs=dict(inputs or {}), error=error)
+        return self.record(result)
 
     def credential(self, protocol, credential_id):
         """Refer to a credential already stored by NetExec."""
@@ -283,7 +383,7 @@ class HostContext:
             return lambda **options: self.connect(name, **options)
         raise AttributeError(name)
 
-    def connect(self, protocol, *, anonymous=False, credential=None, stop_on_error=True, **options):
+    def connect(self, protocol, *, anonymous=False, credential=None, stop_on_error=_UNSET, **options):
         """Reuse one session per protocol and authentication choice on this host."""
         if protocol not in self.protocols:
             raise ValueError(f"Unknown protocol: {protocol}")
