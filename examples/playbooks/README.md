@@ -10,6 +10,23 @@ Run one with:
 nxc playbook <target> <path-to-playbook> -u USER -p PASS -d DOMAIN [--allow-target HOST ...]
 ```
 
+## Start here — the two master sweeps
+
+Two aggregate, read-only/detection-only sweeps built for speed at the start of an
+engagement. Each prints a per-host **access checklist** (and saves the full result
+to NXC_PATH) so you know exactly what an identity can reach across SMB, LDAP,
+MSSQL, WinRM, RDP, SSH, FTP, VNC and NFS — plus detection-only CVE/infra checks
+(zerologon, nopac, printnightmare, smbghost, ms17-010, coerce_plus, sccm). Readable
+SMB shares are spidered and fully downloaded. Nothing is exploited.
+
+- **`master_playbook_anon.py`** — run at the very start, no credential. Probes
+  `null`, `Guest`, and `thisuserdoesnotexist` and shows what each can do unauthenticated.
+  `nxc playbook <targets> examples/playbooks/master_playbook_anon.py [-d DOMAIN] [--dns-server DC_IP]`
+- **`master_playbook_authenticated.py`** — run the moment you get one credential
+  (`-u/-p`, `-H` hash, or `-k`). Shows everything that credential can reach and read,
+  plus kerberoast / LAPS / BloodHound / mssql_priv.
+  `nxc playbook <targets> examples/playbooks/master_playbook_authenticated.py -u USER -p PASS -d DOMAIN`
+
 ## Layout
 
 - **`teaching/<protocol>/`** — small, single-concept examples to learn the API,
@@ -31,7 +48,7 @@ nxc playbook <target> <path-to-playbook> -u USER -p PASS -d DOMAIN [--allow-targ
   them (loaded via `Path(__file__).with_name(...)`).
 - **`smoke/`** — quick read-only smoke tests: `lab_smoke.py`, `recon.py`.
 
-## The P0 API in one screen
+## The playbook API in one screen
 
 ```python
 def run(host):

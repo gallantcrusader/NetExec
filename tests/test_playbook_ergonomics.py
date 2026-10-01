@@ -1,4 +1,4 @@
-"""P0 playbook ergonomics: session.authenticated/credential/admin, result.rows/one(),
+"""Playbook ergonomics: session.authenticated/credential/admin, result.rows/one(),
 host.defaults() with per-call priority, result.index + host.evidence(), host.finding(),
 and the ModuleResult container.
 """
