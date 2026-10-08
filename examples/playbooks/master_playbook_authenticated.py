@@ -7,32 +7,107 @@ and delegation-abusable accounts, LAPS/gMSA it can read, MSSQL logins/links/
 impersonation, WinRM command access, plus detection-only checks for the usual AD
 CVEs and infrastructure (ADCS, SCCM).
 
-It is read-only and detection-only: nothing is exploited, no coercion is fired,
-no relay is set up. Readable SMB shares are fully downloaded so you can see and
-keep everything this credential can take.
+It is read-only and detection-only, with ONE active exception: the pre2k check
+(ALL=true) attempts Kerberos pre-auth for pre-created computer accounts. Nothing
+else is exploited, no coercion is fired, no relay is set up. Readable SMB shares
+are fully downloaded so you can see and keep everything this credential can take.
 
     nxc playbook <targets> examples/playbooks/master_playbook_authenticated.py -u USER -p PASS -d DOMAIN
     nxc playbook <targets> examples/playbooks/master_playbook_authenticated.py -u USER -H NTHASH -d DOMAIN
     nxc playbook <targets> examples/playbooks/master_playbook_authenticated.py -u USER -p PASS -k --dns-server DC_IP
 
-Results print as a per-host checklist and are saved to NXC_PATH.
+The sweep narrates each step (``[>] ...``) as it runs and prints a per-host
+checklist at the end; the full result is also saved to NXC_PATH.
+
+User descriptions are collected with the ``user-desc`` module, unless you point
+``NXC_USERLIST`` at a username list (a file, one name per line, or a
+comma-separated value) — then descriptions are pulled with a targeted LDAP
+query for exactly those users.
 """
 
+import os
+import threading
 from dataclasses import dataclass, field
 
 from nxc.playbooks.results import ResultStatus
-
-# Effectively-unlimited spider download cap (bytes) so "read" really means "grabbed".
-SPIDER_MAX = 64 * 1024 * 1024 * 1024
 
 # This sweep uses the single credential supplied on the command line (-u/-p, -H, or -k).
 IDENTITIES = [
     ("credential", {}),
 ]
-AUTH_MODE = True  # authenticated sweep: also run kerberoast / LAPS / BloodHound / mssql_priv
+AUTH_MODE = True  # authenticated sweep: also run kerberoast / LAPS / BloodHound / mssql_priv / pre2k
 VULN_IDENT = {}  # host-level vuln detection runs as the supplied credential
 CHECKLIST_TITLE = "AUTHENTICATED ACCESS CHECKLIST"
 FINDING_NAME = "master_playbook_authenticated"
+
+# ===================== shared engine (identical in both master playbooks) ===================== #
+# Effectively-unlimited spider download cap (bytes) so "read" really means "grabbed".
+SPIDER_MAX = 64 * 1024 * 1024 * 1024
+# Hard wall-clock cap (seconds) for each lightweight protocol probe, so a filtered
+# port (SSH/VNC/NFS/RDP/FTP/WinRM) can never freeze the whole sweep.
+SIMPLE_PROBE_TIMEOUT = 20
+# Env var naming a username list for targeted description queries (file path, or
+# a comma-separated value). Unset -> descriptions come from the user-desc module.
+USERLIST_ENV = "NXC_USERLIST"
+
+
+# --------------------------------------------------------------------------- #
+# progress narration (thread-local so concurrent targets never mix their labels)
+# --------------------------------------------------------------------------- #
+_CTX = threading.local()
+
+
+def _say(msg):
+    """Print a progress breadcrumb that stands out from NetExec's own output."""
+    target = getattr(_CTX, "target", "")
+    ident = getattr(_CTX, "ident", "")
+    tag = " · ".join(part for part in (target, ident) if part)
+    print(f"  [>] {tag} — {msg}" if tag else f"  [>] {msg}", flush=True)
+
+
+def _run_bounded(fn, seconds):
+    """Run fn() in a daemon thread and give up after ``seconds``; returns True if
+    it finished in time, False if it timed out (the daemon is then abandoned).
+    """
+    target = getattr(_CTX, "target", "")
+    ident = getattr(_CTX, "ident", "")
+    done = threading.Event()
+
+    def worker():
+        _CTX.target, _CTX.ident = target, ident
+        try:
+            fn()
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return done.wait(seconds)
+
+
+def _load_userlist():
+    """Usernames to target for description queries, from ``$NXC_USERLIST``.
+    The value may be a path to a file (one name per line) or a comma-separated
+    list. Returns [] when unset/empty so the sweep falls back to the module.
+    """
+    raw = os.environ.get(USERLIST_ENV, "").strip()
+    if not raw:
+        return []
+    if os.path.isfile(raw):
+        try:
+            with open(raw, encoding="utf-8") as fh:
+                names = list(fh)
+        except OSError:
+            names = []
+    else:
+        names = raw.split(",")
+    return [n for n in (name.strip() for name in names) if n]
+
+
+def _ldap_escape(value):
+    """Escape the LDAP filter metacharacters in a supplied username."""
+    for char, repl in (("\\", r"\5c"), ("*", r"\2a"), ("(", r"\28"), (")", r"\29"), ("\0", r"\00")):
+        value = value.replace(char, repl)
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -71,7 +146,8 @@ class HostReport:
 # module that hard-exits can never abort the whole sweep)
 # --------------------------------------------------------------------------- #
 def _try(pr, name, fn):
-    """Run one check; record its result under facts[name], swallow failures."""
+    """Narrate, run one check, record its result under facts[name], swallow failures."""
+    _say(f"{pr.protocol}: {name}")
     try:
         value = fn()
         if value is not None:
@@ -157,8 +233,31 @@ def _vuln_status(modresult):
     return "ran/unclear"
 
 
+def _descriptions(ldap):
+    """User descriptions (they often hide passwords). With a userlist in
+    ``$NXC_USERLIST`` run a targeted LDAP query for exactly those users;
+    otherwise fall back to the user-desc module (keyword-matches secrets).
+    """
+    users = _load_userlist()
+    if users:
+        inner = "".join(f"(sAMAccountName={_ldap_escape(u)})" for u in users)
+        filt = f"(&(|{inner})(description=*))"
+        return _enum(ldap.query(query=[filt, "sAMAccountName", "description"]))
+    return _enum(ldap.module("user-desc"))
+
+
+def _pre2k(ldap):
+    """Active, authenticated-only check: attempt pre-auth for pre-created
+    computer accounts with ALL=true. Output is written under
+    NXC_PATH/modules/pre2k/<domain>/; the module logs each hit as it goes.
+    """
+    ldap.module("pre2k", all=True)
+    return "ran (ALL=true) — see NXC_PATH/modules/pre2k/<domain>/"
+
+
 def _safe_open(host, protocol, ident, pr):
     """Open a protocol session for one identity, or record why it could not."""
+    _say(f"{protocol}: connecting")
     try:
         session = getattr(host, protocol)(**ident)
     except (Exception, SystemExit) as e:
@@ -230,11 +329,12 @@ def sweep_ldap(host, ident, auth_mode):
     _try(pr, "gmsa", lambda: _enum(ldap.gmsa()))
     _try(pr, "machine_account_quota", lambda: (lambda m: m.data.quota if m.ok else "denied")(ldap.module("maq")))
     _try(pr, "adcs", lambda: _vuln_status(ldap.module("adcs")))
-    _try(pr, "desc_with_secrets", lambda: _enum(ldap.module("get-desc-users")))
+    _try(pr, "user_descriptions", lambda: _descriptions(ldap))
     if auth_mode:
         _try(pr, "kerberoastable", lambda: _enum(ldap.kerberoasting()))
         _try(pr, "laps_readable", lambda: (lambda m: "readable" if m.ok else "no")(ldap.module("laps")))
         _try(pr, "bloodhound_collected", lambda: (lambda m: "collected" if m.ok else "no (try --dns-server)")(ldap.bloodhound()))
+        _try(pr, "pre2k_precreated", lambda: _pre2k(ldap))
     return pr
 
 
@@ -257,11 +357,20 @@ def sweep_mssql(host, ident, auth_mode):
 
 
 def sweep_simple(host, protocol, ident, extra=None):
-    """Reachability/auth probe for protocols without deep enumeration."""
+    """Reachability/auth probe for protocols without deep enumeration, under a
+    hard wall-clock cap so a filtered port can't freeze the sweep.
+    """
     pr = ProtoResult(protocol)
-    session = _safe_open(host, protocol, ident, pr)
-    if session is not None and extra:
-        extra(pr, session)
+
+    def _probe():
+        session = _safe_open(host, protocol, ident, pr)
+        if session is not None and extra:
+            extra(pr, session)
+
+    if not _run_bounded(_probe, SIMPLE_PROBE_TIMEOUT):
+        _say(f"{protocol}: TIMED OUT after {SIMPLE_PROBE_TIMEOUT}s — skipping")
+        pr.errors.append(f"{protocol}: timed out after {SIMPLE_PROBE_TIMEOUT}s")
+        pr.facts.setdefault("status", f"timed out >{SIMPLE_PROBE_TIMEOUT}s")
     return pr
 
 
@@ -284,6 +393,7 @@ def sweep_vulns(host, ident):
     smb = _safe_open(host, "smb", ident, pr)
     # ms17-010 can reset the SMB connection, so run it last.
     for mod in ("zerologon", "nopac", "printnightmare", "smbghost", "coerce_plus", "ms17-010"):
+        _say(f"vuln: {mod}")
         try:
             if smb is None:
                 statuses[mod] = "unreachable"
@@ -293,6 +403,7 @@ def sweep_vulns(host, ident):
             details[mod] = _messages(m)[:600]
         except (Exception, SystemExit) as e:
             statuses[mod] = f"error:{type(e).__name__}"
+    _say("vuln: sccm")
     try:
         lpr = ProtoResult("ldap")
         ldap = _safe_open(host, "ldap", ident, lpr)
@@ -341,9 +452,12 @@ def print_checklist(report):
 # --------------------------------------------------------------------------- #
 def run(host):
     host.defaults(stop_on_error=False)
+    _CTX.target = host.target
     report = HostReport(target=host.target)
 
     for label, ident in IDENTITIES:
+        _CTX.ident = label
+        _say(f"==== sweeping as identity '{label}' ====")
         ir = IdentityReport(label=label)
         ir.protocols["smb"] = sweep_smb(host, ident)
         ir.protocols["ldap"] = sweep_ldap(host, ident, AUTH_MODE)
@@ -356,8 +470,12 @@ def run(host):
         ir.protocols["nfs"] = sweep_simple(host, "nfs", ident, _nfs_extra)
         report.identities.append(ir)
 
+    _CTX.ident = "vuln-detect"
+    _say("==== host-level vulnerability / infra detection ====")
     report.vulns, report.vuln_detail = sweep_vulns(host, VULN_IDENT)
     report.any_access = any(pr.reachable and (pr.authenticated or pr.facts) for ir in report.identities for pr in ir.protocols.values())
 
+    _CTX.ident = ""
+    _say("sweep complete — results below")
     print_checklist(report)
     return host.finding(FINDING_NAME, ok=report.any_access, data=report, inputs={"identities": [label for label, _ in IDENTITIES]})
