@@ -130,6 +130,13 @@ class LDAPAccountSearchData:
 
 
 @dataclass
+class LDAPDelegationData:
+    domain: str
+    search_filter: str
+    delegations: list[dict]
+
+
+@dataclass
 class LDAPDCListData:
     controllers: list[dict]
     trusts: list[dict]
@@ -1476,15 +1483,18 @@ class ldap(connection):
                 self.logger.highlight(outputFormat.format(*row))
 
         # Building the search filter
-        search_filter = (f"(&(|(UserAccountControl:1.2.840.113556.1.4.803:={UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION})"
-                         f"(UserAccountControl:1.2.840.113556.1.4.803:={UF_TRUSTED_FOR_DELEGATION})"
-                         "(msDS-AllowedToDelegateTo=*)(msDS-AllowedToActOnBehalfOfOtherIdentity=*))"
-                         f"(!(UserAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})))")
+        delegation_filter = (f"(&(|(UserAccountControl:1.2.840.113556.1.4.803:={UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION})"
+                             f"(UserAccountControl:1.2.840.113556.1.4.803:={UF_TRUSTED_FOR_DELEGATION})"
+                             "(msDS-AllowedToDelegateTo=*)(msDS-AllowedToActOnBehalfOfOtherIdentity=*))"
+                             f"(!(UserAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})))")
         # f"(!(UserAccountControl:1.2.840.113556.1.4.803:={UF_SERVER_TRUST_ACCOUNT})))")  This would filter out RBCD to DCs
 
         attributes = ["sAMAccountName", "pwdLastSet", "userAccountControl", "objectCategory", "msDS-AllowedToActOnBehalfOfOtherIdentity", "msDS-AllowedToDelegateTo"]
 
-        resp = self.search(search_filter, attributes)
+        collection_errors = []
+        resp = self.search(delegation_filter, attributes)
+        if self.last_search_error:
+            collection_errors.append(str(self.last_search_error))
         answers = []
         resp_parsed = parse_result_attributes(resp)
         self.logger.debug(f"Total of records returned {len(resp_parsed)}")
@@ -1523,11 +1533,13 @@ class ldap(connection):
                     rbcdObjType = []
                     sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=bytes(databyte))
                     if len(sd["Dacl"].aces) > 0:
-                        search_filter = "(&(|"
+                        principal_filter = "(&(|"
                         for ace in sd["Dacl"].aces:
-                            search_filter += "(objectSid=" + ace["Ace"]["Sid"].formatCanonical() + ")"
-                        search_filter += f")(!(UserAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})))"
-                        delegUserResp = self.search(search_filter, attributes=["sAMAccountName", "objectCategory"])
+                            principal_filter += "(objectSid=" + ace["Ace"]["Sid"].formatCanonical() + ")"
+                        principal_filter += f")(!(UserAccountControl:1.2.840.113556.1.4.803:={UF_ACCOUNTDISABLE})))"
+                        delegUserResp = self.search(principal_filter, attributes=["sAMAccountName", "objectCategory"])
+                        if self.last_search_error:
+                            collection_errors.append(str(self.last_search_error))
                         delegUserResp_parse = parse_result_attributes(delegUserResp)
 
                         for rbcd in delegUserResp_parse:
@@ -1542,11 +1554,29 @@ class ldap(connection):
 
             except Exception as e:
                 self.logger.error(f"Skipping item, cannot process due to error {e}")
+                collection_errors.append(f"could not process delegation entry: {e}")
 
+        delegations = [
+            {
+                "account_name": row[0],
+                "account_type": row[1],
+                "delegation_type": row[2],
+                "delegation_rights_to": list(row[3]) if isinstance(row[3], list) else row[3],
+            }
+            for row in answers
+        ]
         if answers:
             printTable(answers, header=["AccountName", "AccountType", "DelegationType", "DelegationRightsTo"])
         else:
             self.logger.fail("No entries found!")
+
+        if self.playbook_mode:
+            error = "; ".join(dict.fromkeys(collection_errors)) or None
+            status = ResultStatus.FAILED if error else ResultStatus.SUCCESS if delegations else ResultStatus.NEGATIVE
+            return ActionResult(
+                "ldap", "find_delegation", self.host, status,
+                LDAPDelegationData(self.domain, delegation_filter, delegations), error=error,
+            )
 
     def trusted_for_delegation(self):
         # Building the search filter
