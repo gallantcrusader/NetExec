@@ -18,7 +18,17 @@ def test_process_records_and_partial_failures(monkeypatch, filter_value, failure
     legacy.hRpcWinStationCloseServer.return_value = {"ErrorCode": failure != "cleanup", "pResult": 5}
 
     def processes():
-        yield {"ImageName": "Example.exe", "UniqueProcessId": 123, "SessionId": 2, "pSid": "S-1-5-18", "WorkingSetSize": 4567}
+        process = Mock()
+        image_name = Mock()
+        image_name.getValue.return_value = "Example.exe"
+        process.getProcessInfo.return_value = {
+            "ImageName": image_name,
+            "UniqueProcessId": 123,
+            "SessionId": 2,
+            "WorkingSetSize": 4567,
+        }
+        process.getSid.return_value = "S-1-5-18"
+        yield process
         if failure == "enumeration":
             raise RuntimeError("enumeration denied")
 

@@ -10,7 +10,7 @@ import struct
 import threading
 import time
 from binascii import unhexlify
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from random import getrandbits
 
 from impacket import ntlm, smbserver, uuid
@@ -992,7 +992,7 @@ def sign_authpack(data, key, cert_der):
 
 
 def build_pkinit_asreq(username, domain, key, cert_der):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     body = {
         "kdc-options": _KDCOpts({"forwardable", "renewable", "renewable-ok"}),
         "cname": _PrincipalName({
@@ -1093,7 +1093,7 @@ def pkinit_and_hash(pfx_data, username, domain, dc_ip, output_dir):
     cn = Principal()
     cn = cn.from_asn1(as_rep, "crealm", "cname")
     seq_set(authenticator, "cname", cn.components_to_asn1)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     authenticator["cusec"] = now.microsecond
     authenticator["ctime"] = KerberosTime.to_asn1(now)
     enc_auth = cipher.encrypt(sess_key, 7, encoder.encode(authenticator), None)
@@ -1121,7 +1121,7 @@ def pkinit_and_hash(pfx_data, username, domain, dc_ip, output_dir):
     sn = Principal(username, type=e2i(constants.PrincipalNameType.NT_UNKNOWN))
     seq_set(rb, "sname", sn.components_to_asn1)
     rb["realm"] = str(as_rep["crealm"])
-    rb["till"] = KerberosTime.to_asn1(datetime.now(timezone.utc) + timedelta(days=1))
+    rb["till"] = KerberosTime.to_asn1(datetime.now(UTC) + timedelta(days=1))
     rb["nonce"] = getrandbits(31)
     seq_set_iter(
         rb, "etype", (int(cipher.enctype), e2i(constants.EncryptionTypes.rc4_hmac))

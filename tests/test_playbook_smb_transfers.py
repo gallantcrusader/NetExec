@@ -88,6 +88,20 @@ def test_upload_and_append_host_download_paths(tmp_path):
     assert result.artifacts[0].path.exists()
 
 
+def test_append_host_single_download_keeps_requested_directory(tmp_path):
+    protocol = ProtocolLoader().load_protocol("nxc/protocols/smb.py")
+    dest_dir = tmp_path / "requested"
+    dest_dir.mkdir()
+    fake = session("get_file", [])
+    fake.args.append_host = True
+    fake.conn.getFile.side_effect = lambda share, path, callback, **kwargs: callback(b"payload")
+    fake.download_file = lambda share, path, callback: protocol.smb.download_file(fake, share, path, callback)
+
+    protocol.smb.get_file_single(fake, r"\nested\remote.bin", str(dest_dir / "chosen.bin"), silent=True)
+
+    assert (dest_dir / "OFFLINE-chosen.bin").read_bytes() == b"payload"
+
+
 def test_access_denied_does_not_retry_with_write_access(tmp_path):
     protocol = ProtocolLoader().load_protocol("nxc/protocols/smb.py")
     fake = session("get_file", [["remote", str(tmp_path / "file")]])

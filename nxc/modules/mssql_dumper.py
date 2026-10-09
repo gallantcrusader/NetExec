@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 import re
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
-from nxc.helpers.path import sanitize_filename
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus, json_value
 
 
@@ -120,7 +120,7 @@ class NXCModule:
         except Exception as e:
             errors.append(str(e) or type(e).__name__)
         if self.save and data.matches:
-            path = Path(NXC_PATH) / "modules" / "mssql-dumper" / f"{sanitize_filename(connection.host)}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+            path = Path(NXC_PATH) / "modules" / "mssql-dumper" / sanitize_path_component(f"{connection.host}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json")
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(json_value(data.matches), indent=2), encoding="utf-8")

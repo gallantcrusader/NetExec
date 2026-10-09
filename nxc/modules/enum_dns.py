@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from nxc.helpers.misc import CATEGORY
-from nxc.helpers.path import sanitize_filename
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
@@ -64,7 +64,7 @@ class NXCModule:
             if errors:
                 break
 
-        path = Path(NXC_PATH) / "logs" / f"DNS-Enum-{sanitize_filename(connection.host)}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        path = Path(NXC_PATH) / "logs" / sanitize_path_component(f"DNS-Enum-{connection.host}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")

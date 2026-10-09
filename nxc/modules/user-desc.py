@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 from ldap3.utils.conv import escape_filter_chars
 
-from nxc.helpers.path import sanitize_filename
 from nxc.parsers.ldap_results import parse_result_attributes
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
 
 
@@ -90,7 +90,7 @@ class NXCModule:
             if matches:
                 context.log.highlight(f"User: {username} - Description: {descriptions}")
         artifacts = []
-        path = Path(NXC_PATH) / f"UserDesc-{sanitize_filename(connection.host)}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        path = Path(NXC_PATH) / sanitize_path_component(f"UserDesc-{connection.host}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8") as output:

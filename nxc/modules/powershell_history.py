@@ -6,7 +6,7 @@ from pathlib import Path
 from impacket.nt_errors import STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND
 from impacket.smbconnection import SessionError
 from nxc.helpers.misc import CATEGORY
-from nxc.helpers.path import sanitize_filename
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
@@ -74,7 +74,8 @@ class NXCModule:
                     for line in record["text"].splitlines():
                         context.log.highlight(f"\t{line}")
                     if self.export:
-                        path = Path(NXC_PATH) / "modules" / "powershell_history" / f"{sanitize_filename(connection.host)}_{sanitize_filename(user)}_{stamp}_{len(records)}_{sanitize_filename(name)}"
+                        filename = sanitize_path_component(f"{connection.host}_{user}_{stamp}_{len(records)}_{name}")
+                        path = Path(NXC_PATH) / "modules" / "powershell_history" / filename
                         try:
                             path.parent.mkdir(parents=True, exist_ok=True)
                             path.write_bytes(record["content"])

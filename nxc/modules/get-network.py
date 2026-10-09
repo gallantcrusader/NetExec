@@ -7,7 +7,7 @@ from pathlib import Path
 from ldap3.utils.dn import escape_rdn
 from nxc.helpers.dns_records import DNS_RECORD, DNS_RPC_RECORD_A, DNS_RPC_RECORD_AAAA, DNS_RPC_RECORD_NODE_NAME
 from nxc.helpers.misc import CATEGORY
-from nxc.helpers.path import sanitize_filename
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
 from nxc.parsers.ldap_results import parse_result_attributes
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
@@ -81,7 +81,7 @@ class NXCModule:
                     export_lines.append(value)
 
         context.log.highlight(f"Found {len(records)} records")
-        path = Path(NXC_PATH) / "logs" / f"{sanitize_filename(connection.host)}_network_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        path = Path(NXC_PATH) / "logs" / sanitize_path_component(f"{connection.host}_network_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("\n".join(export_lines) + ("\n" if export_lines else ""), encoding="utf-8")

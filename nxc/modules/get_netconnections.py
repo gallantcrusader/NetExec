@@ -2,9 +2,9 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
-from nxc.helpers.path import sanitize_filename
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus, json_value
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
 import json
 
@@ -38,7 +38,7 @@ class NXCModule:
             addresses = card.get("IPAddress", {}).get("value")
             if addresses:
                 context.log.success(f"IP Address: {addresses}\tSearch Domain: {card.get('DNSDomainSuffixSearchOrder', {}).get('value')}")
-        path = Path(NXC_PATH) / "logs" / f"network-connections-{sanitize_filename(connection.host)}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        path = Path(NXC_PATH) / "logs" / sanitize_path_component(f"network-connections-{connection.host}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(json_value([cards] if cards else [])), encoding="utf-8")

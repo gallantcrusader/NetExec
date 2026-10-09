@@ -2,7 +2,7 @@ import base64
 from dataclasses import dataclass
 from io import BytesIO
 
-from Crypto.Cipher import AES
+from Cryptodome.Cipher import AES
 from impacket.nt_errors import STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND
 from impacket.smbconnection import SessionError
 from nxc.helpers.misc import CATEGORY
@@ -97,6 +97,6 @@ class NXCModule:
         return crypter.decrypt(buf).decode("utf-8")
 
     def base64_urlsafedecode(self, string):
-        padding = 4 - (len(string) % 4)
+        padding = (4 - len(string) % 4) % 4
         string += "=" * padding
         return base64.urlsafe_b64decode(string)

@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from nxc.helpers.misc import CATEGORY
+from nxc.helpers.path import sanitize_path_component
 from nxc.paths import NXC_PATH
-from nxc.helpers.path import sanitize_filename
 from nxc.parsers.ldap_results import parse_result_attributes
 from nxc.playbooks.results import ActionResult, Artifact, ResultStatus
 
@@ -68,7 +68,7 @@ class NXCModule:
                 errors.append(computer["resolution_error"])
             computers.append(computer)
         if computers:
-            filename = Path(NXC_PATH) / "logs" / f"{sanitize_filename(connection.domain)}-{sanitize_filename(connection.host)}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.obsoletehosts.txt"
+            filename = Path(NXC_PATH) / "logs" / sanitize_path_component(f"{connection.domain}-{connection.host}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.obsoletehosts.txt")
             try:
                 filename.parent.mkdir(parents=True, exist_ok=True)
                 with filename.open("w") as output:

@@ -3,14 +3,14 @@
 import base64
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import date, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 from uuid import UUID
 
 
-class ResultStatus(str, Enum):
+class ResultStatus(StrEnum):
     SUCCESS = "success"
     NEGATIVE = "negative"
     FAILED = "failed"
