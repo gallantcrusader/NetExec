@@ -184,10 +184,10 @@ def test_unknown_module_is_recorded_as_failed_step():
     connected = ActionResult("smb", "connect", host.target, ResultStatus.SUCCESS, ConnectionData(True, True, False))
     session = ProtocolSession(host, "smb", SimpleNamespace(host=host.target), Namespace(module=[], module_options=[]), None, FakeEngine(), connected)
 
-    result = session.module("missing_playbook_module", stop_on_error=False, sample=True)
+    result = session.module("missing_playbook_module", stop_on_error=False, name="NXCBOX")
 
     assert result.status is ResultStatus.FAILED
-    assert result.inputs == {"sample": True}
+    assert result.inputs == {"name": "NXCBOX"}
     assert "Unknown module" in result.error
     assert host.run.results == result.results
 
@@ -449,6 +449,9 @@ def test_connection_options_create_distinct_reusable_sessions(monkeypatch):
 
     assert first is not second
     assert host.ldap(port=636, username="alex", password="secret") is second
+    refreshed = host.ldap(port=636, username="alex", password="secret", fresh=True)
+    assert refreshed is not second
+    assert host.ldap(port=636, username="alex", password="secret") is refreshed
     assert first.args.port == 389
     assert second.args.port == 636
     assert second.args.username == ["alex"]

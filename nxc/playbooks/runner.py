@@ -224,12 +224,12 @@ class ProtocolSession:
             result.inputs = options.copy()
         return self.host.record(result, stop_on_error)
 
-    def module(self, name, *, stop_on_error=_UNSET, **options):
+    def module(self, module_name, *, stop_on_error=_UNSET, **options):
         """Run a module on this connection and return its results as a ModuleResult."""
         stop_on_error = self._stop(stop_on_error)
         if not self.ok:
             message = f"No open {self.protocol} session for {self.host.target}"
-            result = ActionResult(self.protocol, name, self.host.target, ResultStatus.FAILED, FailureData(message), error=message, inputs=options.copy())
+            result = ActionResult(self.protocol, module_name, self.host.target, ResultStatus.FAILED, FailureData(message), error=message, inputs=options.copy())
             return ModuleResult([self.host.record(result, stop_on_error)])
         old_module = self.args.module
         old_options = self.args.module_options
@@ -240,17 +240,17 @@ class ProtocolSession:
             try:
                 module_path = None
                 for folder in (Path(NXC_PATH) / "modules", Path(nxc.__file__).parent / "modules"):
-                    candidate = folder / f"{name}.py"
+                    candidate = folder / f"{module_name}.py"
                     if candidate.is_file():
                         module_path = str(candidate)
                         break
                 if module_path is None:
-                    raise ValueError(f"Unknown module: {name}")
-                self.args.module = [name]
+                    raise ValueError(f"Unknown module: {module_name}")
+                self.args.module = [module_name]
                 self.args.module_options = [f"{key.upper()}={format_module_option(value)}" for key, value in options.items() if value is not None]
                 module = ModuleLoader(self.args, self.db, nxc_logger).init_module(module_path)
                 if module is None:
-                    raise ResultContractError(f"Module {name} could not be loaded")
+                    raise ResultContractError(f"Module {module_name} could not be loaded")
                 previous_count = len(self.connection.action_results)
                 self.connection.modules = [module]
                 self.connection.playbook_stop_on_error = stop_on_error
@@ -264,17 +264,17 @@ class ProtocolSession:
                 self.connection.playbook_stop_on_error = old_stop_on_error
                 self.connection.playbook_session = old_session
             if not results:
-                results = [ActionResult(self.protocol, name, self.connection.host, ResultStatus.SKIPPED, SkippedData("Required privileges are unavailable"))]
+                results = [ActionResult(self.protocol, module_name, self.connection.host, ResultStatus.SKIPPED, SkippedData("Required privileges are unavailable"))]
         except (Exception, SystemExit) as e:
             message = str(e) or type(e).__name__
-            results = [ActionResult(self.protocol, name, self.connection.host, ResultStatus.FAILED, FailureData(message), error=message, events=list(getattr(e, "events", [])))]
+            results = [ActionResult(self.protocol, module_name, self.connection.host, ResultStatus.FAILED, FailureData(message), error=message, events=list(getattr(e, "events", [])))]
         for result in results:
             result.inputs = {**result.inputs, **options}
             self.host.record(result, stop_on_error=False)
         if stop_on_error:
             for result in results:
                 if result.status is ResultStatus.FAILED:
-                    raise PlaybookStepError(result.error or f"{self.protocol}.{name} failed")
+                    raise PlaybookStepError(result.error or f"{self.protocol}.{module_name} failed")
         return ModuleResult(results)
 
     def __getattr__(self, name):
@@ -383,7 +383,7 @@ class HostContext:
             return lambda **options: self.connect(name, **options)
         raise AttributeError(name)
 
-    def connect(self, protocol, *, anonymous=False, credential=None, stop_on_error=_UNSET, **options):
+    def connect(self, protocol, *, anonymous=False, credential=None, fresh=False, stop_on_error=_UNSET, **options):
         """Reuse one session per protocol and authentication choice on this host."""
         if protocol not in self.protocols:
             raise ValueError(f"Unknown protocol: {protocol}")
@@ -408,9 +408,14 @@ class HostContext:
                 raise ValueError("Authentication options cannot be combined with anonymous access or a credential reference")
             for name, value in options.items():
                 setattr(args, name, normalize_connection_option(name, value, getattr(args, name)))
+            if credential is None and "cred_id" not in options and set(options) & {"username", "password", "hash", "aesKey"}:
+                # A CLI -id belongs to this protocol's database. A playbook
+                # may reuse its resolved secret on another protocol whose
+                # credential IDs point at unrelated rows.
+                args.cred_id = []
             key = (protocol, anonymous, credential, json.dumps(json_value(options), sort_keys=True))
             if key in self.sessions:
-                if self.sessions[key].ok:
+                if self.sessions[key].ok and not fresh:
                     return self.sessions[key]
                 self.sessions.pop(key).close()
             if anonymous:

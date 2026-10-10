@@ -142,14 +142,16 @@ def test_seed_or_local_krbtgt_hash_is_not_domain_compromise(playbook):
     assert not kb.da_reached
 
 
-def test_direct_ntds_output_can_prove_domain_compromise(playbook):
+def test_direct_ntds_output_records_material_without_access_proof(playbook):
     kb = playbook.KB(QuietLog(), allowed={"192.0.2.10"})
     nt_hash = "a" * 32
     output = SimpleNamespace(events=[SimpleNamespace(message=f"EXAMPLE\\krbtgt:502:{'0' * 32}:{nt_hash}:::")])
 
     playbook.harvest_events(kb, output, "ntds", "example.test")
 
-    assert kb.da_reached
+    assert not kb.da_reached
+    assert not kb.tier_zero_reached
+    assert kb.tier_zero_material[0]["material"] == "krbtgt hash"
 
 
 def test_pre2k_is_opt_in_and_never_uses_all_accounts(playbook, monkeypatch):
@@ -495,60 +497,50 @@ def test_budget_hit_inside_last_state_is_not_reported_as_saturation(playbook, mo
 
 
 @pytest.mark.parametrize(
-    ("find_status", "trusted_ok", "delegations", "expected_findings"),
+    ("status", "delegations", "error", "expected_findings"),
     [
-        ("negative", False, [], []),
-        ("failed", True, [], ["delegation (find_delegation) incomplete on 192.0.2.10"]),
+        ("negative", [], None, []),
+        ("failed", [], "reader lookup failed", ["delegation enumeration incomplete on 192.0.2.10: reader lookup failed"]),
         (
             "success",
-            True,
-            [{
-                "account_name": "svc_buildlink$",
-                "delegation_type": "Resource-Based Constrained",
-                "delegation_rights_to": "CPTS-DC02$",
-            }],
-            ["RBCD: svc_buildlink$ is allowed on CPTS-DC02$"],
+            [SimpleNamespace(source="svc_buildlink$", source_type="computer", delegation_type="resource-based constrained",
+                             target="CPTS-DC02$", spn="CIFS/cpts-dc02.example.test", protocol_transition=True)],
+            None,
+            ["delegation resource-based constrained: svc_buildlink$ -> CIFS/cpts-dc02.example.test"],
         ),
     ],
 )
 def test_ldap_delegation_reports_structured_find_results(
-    playbook, monkeypatch, find_status, trusted_ok, delegations, expected_findings
+    playbook, monkeypatch, status, delegations, error, expected_findings
 ):
     kb = playbook.KB(QuietLog(), default_domain="example.test")
     host = SimpleNamespace(target="192.0.2.10")
-
-    def action(_kb, _session, name, *_args, **_kwargs):
-        if name == "find_delegation":
-            return SimpleNamespace(
-                ok=find_status == "success", status=find_status, data=SimpleNamespace(delegations=delegations)
-            )
-        return SimpleNamespace(ok=trusted_ok)
-
-    monkeypatch.setattr(playbook, "do_action", action)
+    item = SimpleNamespace(ok=status == "success", error=error, data=SimpleNamespace(delegations=delegations))
+    monkeypatch.setattr(playbook, "do_module", lambda *args, **kwargs: SimpleNamespace(results=[item]))
 
     playbook.ldap_delegation(kb, host, None, object())
 
     assert kb.findings == expected_findings
+    assert len(kb.delegation_edges) == len(delegations)
+    if delegations:
+        assert kb.delegation_edges[0]["complete"]
 
 
 def test_ldap_delegation_retains_partial_structured_results(playbook, monkeypatch):
     kb = playbook.KB(QuietLog(), default_domain="example.test")
     host = SimpleNamespace(target="192.0.2.10")
-    delegation = {
-        "account_name": "svc_buildlink$",
-        "delegation_type": "Resource-Based Constrained",
-        "delegation_rights_to": "CPTS-DC02$",
-    }
-
-    def action(_kb, _session, name, *_args, **_kwargs):
-        if name == "find_delegation":
-            return SimpleNamespace(
-                ok=False, error="one principal lookup failed", data=SimpleNamespace(delegations=[delegation])
-            )
-        return SimpleNamespace(ok=True)
-
-    monkeypatch.setattr(playbook, "do_action", action)
+    delegation = SimpleNamespace(source="svc_buildlink$", source_type="computer",
+                                 delegation_type="resource-based constrained", target="CPTS-DC02$",
+                                 spn="CIFS/cpts-dc02.example.test", protocol_transition=True)
+    item = SimpleNamespace(ok=False, error="one principal lookup failed",
+                           data=SimpleNamespace(delegations=[delegation]))
+    monkeypatch.setattr(playbook, "do_module", lambda *args, **kwargs: SimpleNamespace(results=[item]))
 
     playbook.ldap_delegation(kb, host, None, object())
 
-    assert kb.findings == ["partial RBCD: svc_buildlink$ is allowed on CPTS-DC02$"]
+    assert kb.findings == [
+        "delegation enumeration incomplete on 192.0.2.10: one principal lookup failed",
+        "partial delegation resource-based constrained: svc_buildlink$ -> CIFS/cpts-dc02.example.test",
+    ]
+    assert len(kb.delegation_edges) == 1
+    assert not kb.delegation_edges[0]["complete"]

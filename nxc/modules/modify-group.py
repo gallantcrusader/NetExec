@@ -42,6 +42,7 @@ class NXCModule:
 
         Optional:
         REMOVE      Set to 'True' to remove the user from the specified group instead of adding (default: False)
+        GROUP_DN    Require the resolved LDAP group DN to match this exact DN before modifying it
 
         Examples
         --------
@@ -61,6 +62,7 @@ class NXCModule:
 
         """
         self.group = module_options.get("GROUP")
+        self.group_dn = module_options.get("GROUP_DN")
         self.target_user = module_options.get("USER")
         self.remove = module_options.get("REMOVE", "False").lower() == "true"
 
@@ -141,6 +143,9 @@ class NXCModule:
             return
         self.data.group_dn = self.find_object_dn(self.group)
         if self.data.group_dn is None:
+            return
+        if self.group_dn and self.data.group_dn.casefold() != self.group_dn.casefold():
+            self.errors.append(f"Resolved group DN does not match GROUP_DN for {self.group}")
             return
         try:
             acknowledged = self.connection.ldap_connection.modify(self.data.group_dn, {"member": [(MODIFY_DELETE if self.remove else MODIFY_ADD, [self.data.user_dn])]})

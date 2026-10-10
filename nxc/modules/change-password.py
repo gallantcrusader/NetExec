@@ -1,8 +1,11 @@
-import sys
+from dataclasses import dataclass
+from sys import exit
+
 from impacket.dcerpc.v5 import samr, epm
 from impacket.dcerpc.v5.rpcrt import DCERPCException
 from nxc.helpers.misc import CATEGORY
 from nxc.helpers.rpc import NXCRPCConnection
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -15,6 +18,18 @@ class NXCModule:
     description = "Change or reset user passwords via various protocols"
     supported_protocols = ["smb"]
     category = CATEGORY.PRIVILEGE_ESCALATION
+
+    @dataclass
+    class ResultData:
+        username: str
+        domain: str
+        credential_kind: str
+        new_secret: str
+        completed: bool = False
+        stored: bool = False
+        credential_id: int | None = None
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """
@@ -39,9 +54,9 @@ class NXCModule:
         self.newhash = module_options.get("NEWNTHASH")
         self.target_user = module_options.get("USER")
 
-        if not self.newpass and not self.newhash:
-            context.log.fail("Either NEWPASS or NEWNTHASH is required!")
-            sys.exit(1)
+        if bool(self.newpass) == bool(self.newhash):
+            context.log.fail("Specify exactly one of NEWPASS or NEWNTHASH")
+            exit(1)
 
     def authenticate(self, context, connection, protocol, anonymous=False):
         # Authenticate to the target using DCE/RPC with either user credentials or a null session. Establishes a connection and binds to the SAMR service.
@@ -71,61 +86,60 @@ class NXCModule:
         self.context = context
         target_username = self.target_user or connection.username
         target_domain = connection.domain
-
-        # Grab all creds from the connection to use for authentication
         self.oldpass = connection.password
         self.oldhash = connection.nthash
-
-        new_lmhash, new_nthash = "", ""
-
-        # Parse new hash values if provided
-        if self.newhash:
+        new_nthash = self.newhash.rsplit(":", 1)[-1] if self.newhash else ""
+        data = self.ResultData(target_username, target_domain,
+                               "hash" if self.newhash else "plaintext", new_nthash or self.newpass)
+        errors = []
+        self.dce = None
+        self.handles = []
+        try:
             try:
-                new_lmhash, new_nthash = self.newhash.split(":")
-            except ValueError:
-                new_nthash = self.newhash
-
-        try:
-            self.dce = self.authenticate(context, connection, protocol="ncacn_np", anonymous=False)
+                self.dce = self.authenticate(context, connection, protocol="ncacn_np", anonymous=False)
+            except Exception as e:
+                if any(code in str(e) for code in ("STATUS_PASSWORD_MUST_CHANGE", "STATUS_PASSWORD_EXPIRED",
+                                                    "STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT")):
+                    context.log.info("Password change requires a null-session SAMR connection")
+                    self.dce = self.authenticate(context, connection, protocol="ncacn_ip_tcp", anonymous=True)
+                else:
+                    raise
+            self.smb_samr_change(context, connection, target_username, self.oldhash, self.newpass, new_nthash)
+            data.completed = True
+            user_ids = [row._mapping["id"] for row in (context.db.get_user(target_domain, target_username) or [])]
+            if user_ids:
+                context.db.remove_credentials(user_ids)
+            context.db.add_credential(data.credential_kind, target_domain, target_username, data.new_secret)
+            matches = [row._mapping["id"] for row in (context.db.get_user(target_domain, target_username) or [])
+                       if row._mapping["credtype"] == data.credential_kind
+                       and row._mapping["password"] == data.new_secret]
+            if len(matches) != 1:
+                raise RuntimeError("Changed credential was not found in the NetExec database")
+            data.credential_id = matches[0]
+            data.stored = True
         except Exception as e:
-            # Handle specific errors like password expiration or must be change
-            if "STATUS_PASSWORD_MUST_CHANGE" in str(e) or "STATUS_PASSWORD_EXPIRED" in str(e) or "STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT" in str(e):
-                context.log.warning("Password must be changed. Trying with null session.")
-                self.dce = self.authenticate(context, connection, protocol="ncacn_ip_tcp", anonymous=True)
-            elif "STATUS_LOGON_FAILURE" in str(e):
-                context.log.fail("Authentication failure: wrong credentials.")
-                return False
-            else:
-                raise
-
-        try:
-            # Perform the SMB SAMR password change
-            self._smb_samr_change(context, connection, target_username, target_domain, self.oldhash, self.newpass, new_nthash)
-
-            # Remove user if exists to avoid outdated credentials when we update plaintext password, but hash exists (or vice versa)
-            user = self.context.db.get_user(target_domain, target_username)
-            user_ids = [row[0] for row in user]
-            self.context.db.remove_credentials(user_ids)
-
-            # Store the new credentials in the database
-            if new_nthash:
-                self.context.db.add_credential("hash", target_domain, target_username, new_nthash)
-            else:
-                self.context.db.add_credential("plaintext", target_domain, target_username, self.newpass)
-        except Exception as e:
-            if "STATUS_ACCESS_DENIED" in str(e):
-                self.context.log.fail(f"STATUS_ACCESS_DENIED while changing password for user: {target_username}")
-            elif "STATUS_NONE_MAPPED" in str(e):
-                self.context.log.fail(f"User '{target_username}' not found or not resolvable")
-            else:
-                context.log.fail(f"SMB-SAMR password change failed: {e}")
+            errors.append(str(e) or type(e).__name__)
         finally:
-            self.dce.disconnect()
+            if self.dce is not None:
+                for handle in reversed(self.handles):
+                    try:
+                        samr.hSamrCloseHandle(self.dce, handle)
+                    except Exception as e:
+                        errors.append(f"Closing SAMR handle: {e}")
+                try:
+                    self.dce.disconnect()
+                except Exception as e:
+                    errors.append(f"Closing SAMR connection: {e}")
+        for error in errors:
+            context.log.fail(error)
+        return ActionResult("smb", self.name, connection.host,
+                            ResultStatus.SUCCESS if data.completed and data.stored and not errors else ResultStatus.FAILED,
+                            data, error="; ".join(errors) or None)
 
-    def _smb_samr_change(self, context, connection, target_username, target_domain, oldHash, newPassword, newHash):
+    def smb_samr_change(self, context, connection, target_username, oldHash, newPassword, newHash):
         # Reset the password for a different user
         if target_username != connection.username:
-            user_handle = self._hSamrOpenUser(connection, target_username)
+            user_handle = self.samr_open_user(connection, target_username)
             samr.hSamrSetNTInternal1(self.dce, user_handle, newPassword, newHash)
             context.log.success(f"Successfully changed password for {target_username}")
         else:
@@ -135,15 +149,19 @@ class NXCModule:
                 samr.hSamrUnicodeChangePasswordUser2(self.dce, "\x00", target_username, self.oldpass, newPassword, "", oldHash)
             else:
                 # Change the password with new hash
-                user_handle = self._hSamrOpenUser(connection, target_username)
+                user_handle = self.samr_open_user(connection, target_username)
                 samr.hSamrChangePasswordUser(self.dce, user_handle, self.oldpass, "", oldHash, "aad3b435b51404eeaad3b435b51404ee", newHash)
                 context.log.highlight("Note: Target user must change password at next logon.")
             context.log.success(f"Successfully changed password for {target_username}")
 
-    def _hSamrOpenUser(self, connection, username):
+    def samr_open_user(self, connection, username):
         """Connect to the target server and retrieve the user handle"""
         server_handle = samr.hSamrConnect(self.dce, connection.host + "\x00")["ServerHandle"]
+        self.handles.append(server_handle)
         domain_sid = samr.hSamrLookupDomainInSamServer(self.dce, server_handle, connection.domain)["DomainId"]
         domain_handle = samr.hSamrOpenDomain(self.dce, server_handle, domainId=domain_sid)["DomainHandle"]
+        self.handles.append(domain_handle)
         user_rid = samr.hSamrLookupNamesInDomain(self.dce, domain_handle, (username,))["RelativeIds"]["Element"][0]
-        return samr.hSamrOpenUser(self.dce, domain_handle, userId=user_rid)["UserHandle"]
+        user_handle = samr.hSamrOpenUser(self.dce, domain_handle, userId=user_rid)["UserHandle"]
+        self.handles.append(user_handle)
+        return user_handle

@@ -71,3 +71,28 @@ def test_kerberos_default_applies_to_ldap_connection(monkeypatch):
     assert session.args.kerberos is True
     assert session.args.kdcHost == "192.0.2.10"
     host.close()
+
+
+def test_explicit_login_does_not_reuse_cli_credential_id_on_another_protocol(monkeypatch):
+    class OfflineLDAP:
+        def __init__(self, args, db, target, defer_flow=False):
+            self.args = args
+            self.host = target
+            self.transport_open = False
+
+        def open_session(self, anonymous=False):
+            return False
+
+        def close_session(self):
+            pass
+
+    host = runner.HostContext("offline.invalid", ["-id", "1"])
+    host.protocols = {"ldap": {"path": "protocol", "dbpath": "database"}}
+    monkeypatch.setattr(host.loader, "load_protocol", lambda path: SimpleNamespace(ldap=OfflineLDAP) if path == "protocol" else SimpleNamespace(database=lambda engine: object()))
+    monkeypatch.setattr(runner, "create_db_engine", lambda path: Mock())
+    assert host.ldap(stop_on_error=False).args.cred_id == ["1"]
+    explicit = host.ldap(username=["jon.snow"], password=["seed-secret"], stop_on_error=False)
+    assert explicit.args.cred_id == []
+    assert explicit.args.username == ["jon.snow"]
+    assert explicit.args.password == ["seed-secret"]
+    host.close()

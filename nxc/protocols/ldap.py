@@ -130,6 +130,25 @@ class LDAPAccountSearchData:
 
 
 @dataclass
+class GMSAAccount:
+    account: str
+    reader_sids: list[str] = field(default_factory=list)
+    reader_principals: list[str] = field(default_factory=list)
+    password_readable: bool = False
+    rc4: str | None = None
+    aes128: str | None = None
+    aes256: str | None = None
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LDAPGMSAData:
+    domain: str
+    search_filter: str
+    accounts: list[GMSAAccount]
+
+
+@dataclass
 class LDAPDelegationData:
     domain: str
     search_filter: str
@@ -1654,41 +1673,49 @@ class ldap(connection):
             ],
         )
         gmsa_accounts_parsed = parse_result_attributes(gmsa_accounts)
+        errors = [self.last_search_error] if self.last_search_error else []
+        data = LDAPGMSAData(self.domain, search_filter, [])
         if gmsa_accounts_parsed:
             self.logger.debug(f"Total of records returned {len(gmsa_accounts_parsed):d}")
 
             for acc in gmsa_accounts_parsed:
-                # PrincipalAllowedToRetrieveGMSAPassword
-                principal_with_read = []
+                account = GMSAAccount(acc["sAMAccountName"])
+                data.accounts.append(account)
                 if "msDS-GroupMSAMembership" in acc:
-                    msDS_GroupMSAMembership = acc["msDS-GroupMSAMembership"]
-                    dacl = ldaptypes.SR_SECURITY_DESCRIPTOR(data=bytes(msDS_GroupMSAMembership))
-
-                    # Get all SIDs that have the right to read the password
-                    sids = [ace["Ace"]["Sid"].formatCanonical() for ace in dacl["Dacl"]["Data"] if ace["AceType"] == 0x00]
-                    self.logger.debug(f"msDS-GroupMSAMembership: {sids}")
-                    search_filter = "(|" + "".join([f"(objectSid={sid})" for sid in sids]) + ")"
-                    resp = self.ldap_connection.search(
-                        searchBase=self.baseDN,
-                        searchFilter=search_filter,
-                        attributes=["sAMAccountName"],
-                        sizeLimit=0,
-                    )
-                    resp_parsed = parse_result_attributes(resp)
-                    if len(resp_parsed) > 1:
-                        principal_with_read = [f"{item['sAMAccountName']}" for item in resp_parsed]
-                    elif len(resp_parsed) == 1:
-                        principal_with_read = resp_parsed[0]["sAMAccountName"]
+                    try:
+                        dacl = ldaptypes.SR_SECURITY_DESCRIPTOR(data=bytes(acc["msDS-GroupMSAMembership"]))
+                        account.reader_sids = [ace["Ace"]["Sid"].formatCanonical() for ace in dacl["Dacl"]["Data"] if ace["AceType"] == 0x00]
+                    except Exception as e:
+                        account.errors.append(f"Reader descriptor: {e}")
+                    self.logger.debug(f"msDS-GroupMSAMembership: {account.reader_sids}")
+                    if account.reader_sids:
+                        reader_filter = "(|" + "".join(f"(objectSid={sid})" for sid in account.reader_sids) + ")"
+                        resp_parsed = parse_result_attributes(self.search(reader_filter, ["sAMAccountName"], baseDN=self.baseDN))
+                        if self.last_search_error:
+                            account.errors.append(f"Reader lookup: {self.last_search_error}")
+                        account.reader_principals = [item["sAMAccountName"] for item in resp_parsed if "sAMAccountName" in item]
 
                 # Get the password
-                rc4 = "<no read permissions>"
-                aes128 = aes256 = ""
                 if "msDS-ManagedPassword" in acc:
-                    rc4, aes128, aes256 = self.gmsa_compute_secrets(acc["msDS-ManagedPassword"], acc["sAMAccountName"])
-                self.logger.highlight(f"Account: {acc['sAMAccountName']:<20} NTLM: {rc4:<36} PrincipalsAllowedToReadPassword: {principal_with_read}")
-                if aes128 and aes256:
-                    self.logger.highlight(f"Account: {acc['sAMAccountName']:<20} aes128-cts-hmac-sha1-96: {aes128}")
-                    self.logger.highlight(f"Account: {acc['sAMAccountName']:<20} aes256-cts-hmac-sha1-96: {aes256}")
+                    try:
+                        account.rc4, account.aes128, account.aes256 = self.gmsa_compute_secrets(acc["msDS-ManagedPassword"], acc["sAMAccountName"])
+                        account.password_readable = True
+                    except Exception as e:
+                        account.errors.append(f"Managed password: {e}")
+                shown_key = account.rc4 or ("<decode failed>" if "msDS-ManagedPassword" in acc else "<no read permissions>")
+                self.logger.highlight(f"Account: {account.account:<20} NTLM: {shown_key:<36} PrincipalsAllowedToReadPassword: {account.reader_principals}")
+                if account.aes128 and account.aes256:
+                    self.logger.highlight(f"Account: {account.account:<20} aes128-cts-hmac-sha1-96: {account.aes128}")
+                    self.logger.highlight(f"Account: {account.account:<20} aes256-cts-hmac-sha1-96: {account.aes256}")
+                errors.extend(f"{account.account}: {message}" for message in account.errors)
+        for error in errors:
+            self.logger.fail(error)
+        if self.playbook_mode:
+            return ActionResult(
+                "ldap", "gmsa", self.host,
+                ResultStatus.FAILED if errors else ResultStatus.SUCCESS if data.accounts else ResultStatus.NEGATIVE,
+                data, error="; ".join(errors) or None,
+            )
 
     def gmsa_compute_secrets(self, password_data: bytes, sAMAccountName: str):
         """Generate RC4, AES128, and AES256 keys for a GMSA account based on the provided password data and username."""

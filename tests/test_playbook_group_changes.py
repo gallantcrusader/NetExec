@@ -63,3 +63,20 @@ def test_samr_cleanup_failure_retains_completed_change(monkeypatch):
     assert result.data.group_rid == 512
     assert [call.args[1] for call in close.call_args_list] == ["group", "domain", "server"]
     add.assert_called_once_with(rpc, "group", 1001, 0x7)
+
+
+def test_ldap_group_change_rejects_unexpected_group_dn_before_write():
+    code = import_module("nxc.modules.modify-group")
+    module = code.NXCModule()
+    context = SimpleNamespace(protocol="ldap", log=Mock())
+    module.options(context, {"USER": "alice", "GROUP": "Domain Admins",
+                             "GROUP_DN": "CN=Domain Admins,CN=Users,DC=example,DC=test"})
+    conn = SimpleNamespace(host="offline.invalid", search=Mock(side_effect=[
+        [entry("CN=Alice,CN=Users,DC=example,DC=test")],
+        [entry("CN=Domain Admins,CN=Users,DC=other,DC=test")],
+    ]), last_search_error=None, ldap_connection=Mock())
+    result = module.on_login(context, conn)
+    assert result.status is ResultStatus.FAILED
+    assert not result.data.completed
+    assert "does not match GROUP_DN" in result.error
+    conn.ldap_connection.modify.assert_not_called()
