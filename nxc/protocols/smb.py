@@ -63,7 +63,8 @@ from impacket.smb3structs import (
 from impacket.dcerpc.v5 import tsts as TSTS
 
 from nxc.config import process_secret, host_info_colors, check_guest_account, display_dc
-from nxc.connection import connection, sem, requires_admin, dcom_FirewallChecker
+from nxc.connection import connection, sem, requires_admin
+from nxc.helpers.rpc import dcom_FirewallChecker
 from nxc.helpers.misc import gen_random_string, validate_ntlm
 from nxc.logger import NXCAdapter
 from nxc.paths import NXC_PATH
@@ -255,7 +256,7 @@ class smb(connection):
         self.server_os_major = None
         self.server_os_minor = None
         self.server_os_build = None
-        self.os_arch = 0
+        self.os_arch = None
         self.hash = None
         self.lmhash = ""
         self.nthash = ""
@@ -311,7 +312,7 @@ class smb(connection):
         except Exception as e:
             self.logger.debug(f"Error retrieving os arch of {self.host}: {e!s}")
 
-        return 0
+        return None
 
     def enum_host_info(self):
         self.local_ip = self.conn.getSMBServer().get_socket().getsockname()[0]
@@ -328,27 +329,33 @@ class smb(connection):
                 self.no_ntlm = True
                 self.logger.debug("NTLM not supported")
 
+        # Runs before the DC check: the RPC tier reuses its port 135 result instead of probing the port again
+        self.os_arch = self.get_os_arch()
+
         aggressive_check = bool(self.args.generate_hosts_file or self.args.generate_krb5_file)
         self.is_host_dc(aggressive_check=aggressive_check)
 
         # self.domain is the attribute we authenticate with
         # self.targetDomain is the attribute which gets displayed as host domain
+        # self.remoteName is the attribute which gets used in the SPN
+        self.hostname = self.host
+        self.targetDomain = self.host
+        self.remoteName = self.host
         if not self.no_ntlm:
             # Try to get hostname with getServerDNSHostName as getServerName is truncated to 15 chars
-            dns_hostname = self.conn.getServerDNSHostName()
+            dns_hostname = sanitize_dns(self.conn.getServerDNSHostName() or self.conn.getServerName(), self.logger)
             if dns_hostname and "." in dns_hostname:
-                hostname = dns_hostname.split(".", 1)[0]
-            elif dns_hostname:
-                hostname = dns_hostname
+                self.hostname = dns_hostname.split(".", 1)[0]
             else:
-                hostname = self.conn.getServerName()
-            self.hostname = sanitize_dns(hostname, self.logger)
+                self.hostname = dns_hostname
             self.targetDomain = sanitize_dns(self.conn.getServerDNSDomainName() or self.hostname, self.logger)
+            # Preserve IP as target if not required by Kerberos to avoid issues when DNS is not resolvable
+            self.remoteName = dns_hostname if self.kerberos else self.host
         else:
             try:
                 # If we know the host is a DC we can still get the hostname over LDAP if NTLM is not available
                 if self.isdc and detect_if_ip(self.host):
-                    self.hostname, self.domain = LDAPResolution(self.host).get_resolution()
+                    self.hostname, self.domain, self.remoteName = LDAPResolution(self.host).get_resolution()
                     self.targetDomain = self.domain
                 # If we can't authenticate with NTLM and the target is supplied as a FQDN we must parse it
                 else:
@@ -356,19 +363,12 @@ class smb(connection):
                     import socket
                     socket.inet_aton(self.host)
                     self.logger.debug("NTLM authentication not available! Authentication will fail without a valid hostname and domain name")
-                    self.hostname = self.host
-                    self.targetDomain = self.host
             except OSError:
                 if self.host.count(".") >= 1:
                     self.hostname = self.host.split(".")[0]
                     self.targetDomain = ".".join(self.host.split(".")[1:])
-                else:
-                    self.hostname = self.host
-                    self.targetDomain = self.host
             except Exception as e:
                 self.logger.debug(f"Error getting hostname from LDAP: {e}")
-                self.hostname = self.host
-                self.targetDomain = self.host
 
         if self.args.domain:
             self.domain = self.args.domain
@@ -383,7 +383,6 @@ class smb(connection):
 
         # As of June 2024 Samba will always report the version as "Windows 6.1", apparently due to a bug https://stackoverflow.com/a/67577401/17395725
         # Together with the reported build version "0" by Samba we can assume that it is a Samba server. Windows should always report a build version > 0
-        # Also only on Windows we should get an OS arch as for that we would need MSRPC
         try:
             self.server_os = self.conn.getServerOS()
             self.server_os_major = self.conn.getServerOSMajor()
@@ -396,9 +395,9 @@ class smb(connection):
         if isinstance(self.server_os.lower(), bytes):
             self.server_os = self.server_os.decode("utf-8")
 
-        if "Windows 6.1" in self.server_os and self.server_os_build == 0 and self.os_arch == 0:
+        if "Windows 6.1" in self.server_os and self.server_os_build == 0:
             self.server_os = "Unix - Samba"
-        elif self.server_os_build == 0 and self.os_arch == 0:
+        elif self.server_os_build == 0:
             self.server_os = "Unix"
         self.logger.debug(f"Server OS: {self.server_os} {self.server_os_major}.{self.server_os_minor} build {self.server_os_build}")
 
@@ -408,8 +407,6 @@ class smb(connection):
             self.signing = self._is_signing_required()
         except Exception as e:
             self.logger.debug(e)
-
-        self.os_arch = self.get_os_arch()
 
         # moved at the end because it can cause issues with some DCs if we try to login as guest before checking if dc or not
         if check_guest_account and not self.no_ntlm:
@@ -437,9 +434,6 @@ class smb(connection):
             )
         except Exception as e:
             self.logger.debug(f"Error adding host {self.host} into db: {e!s}")
-
-        # DCOM connection with kerberos needed
-        self.remoteName = self.host if not self.kerberos else f"{self.hostname}.{self.targetDomain}"
 
         # using kdcHost is buggy on impacket when using trust relation between ad so we kdcHost must stay to none if targetdomain is not equal to domain
         if not self.kdcHost and self.domain and self.domain == self.targetDomain:
@@ -551,6 +545,8 @@ class smb(connection):
                 if self.args.generate_st:
                     self.save_st(tgs, sk, spn if self.args.spn else None)
 
+            if not tgs and not useCache:
+                self.logger.debug(f"TGS for cifs/{self.remoteName} will be requested")
             self.conn.kerberosLogin(self.username, password, domain, lmhash, nthash, aesKey, kdcHost, useCache=useCache, TGS=tgs)
 
             if self.args.generate_st:
@@ -1018,9 +1014,7 @@ class smb(connection):
         if self.isdc is not None:
             return self.isdc
 
-        probes = [self._is_dc_via_smb]
-        if aggressive_check:
-            probes.append(self._is_dc_via_rpc)
+        probes = [self._is_dc_via_smb, self._is_dc_via_rpc]
         if self.no_ntlm or aggressive_check:
             probes.append(self._is_dc_via_kerberos)
 
@@ -1039,17 +1033,13 @@ class smb(connection):
         session we already hold answers without enumerating every share (unlike
         listShares). ACCESS_DENIED still proves the share exists, hence a DC.
 
-        Meant to run while the null session is still fresh. When there is no
-        session, the reason is decisive: a DC with NTLM enabled always accepts
-        the null bind, so "NTLM on + no null session" means this is NOT a DC.
-        Only "NTLM disabled" is inconclusive here (a real DC can refuse the null
-        bind then), so we hand that case off to the Kerberos tier.
+        Meant to run while the null session is still fresh. Without a session
+        this check is inconclusive: DCs can refuse the null bind (Server 2025
+        does by default, as does an NTLM-disabled DC), so we hand off to the
+        RPC/Kerberos tiers.
         """
         if not self.null_auth:
-            if not self.no_ntlm:
-                self.logger.debug("NTLM enabled but no null session: host is not a DC")
-                return False
-            self.logger.debug("No null session (NTLM disabled): deferring to Kerberos")
+            self.logger.debug("No null session: SMB DC check inconclusive, deferring to RPC/Kerberos")
             return None
         try:
             tid = self.conn.connectTree("SYSVOL")
@@ -1105,15 +1095,17 @@ class smb(connection):
     def _is_dc_via_rpc(self):
         """
         Unauthenticated Netlogon endpoint-mapper lookup on 135. NTLM-agnostic
-        and needs no session;
+        and needs no session. get_os_arch() already talks to the endpoint mapper
+        on every scan, so this adds no new port and runs only when that call
+        reached 135 (no extra timeout when 135 is filtered, e.g. over proxychains).
         """
         from impacket.dcerpc.v5 import nrpc, epm
 
-        if not self._is_port_open(135):
-            self.logger.debug("Port 135 closed/filtered: RPC inconclusive, deferring to Kerberos")
+        if self.os_arch is None:
+            self.logger.debug("Port 135 unreachable (OS arch probe failed): RPC inconclusive, deferring to Kerberos")
             return None
 
-        self.logger.debug("Port 135 is open, attempting Netlogon MSRPC lookup...")
+        self.logger.debug("Port 135 reachable, attempting Netlogon MSRPC lookup...")
         try:
             epm.hept_map(self.host, nrpc.MSRPC_UUID_NRPC, protocol="ncacn_ip_tcp")
             self.logger.debug("Netlogon endpoint registered: host is a DC")
@@ -2246,7 +2238,7 @@ class smb(connection):
             interface = dcom.CoCreateInstanceEx(CLSID_WbemLevel1Login, IID_IWbemLevel1Login)
             login = IWbemLevel1Login(interface)
             resources.append(login)
-            flag, binding = dcom_FirewallChecker(interface, self.host, self.args.dcom_timeout)
+            flag, binding = dcom_FirewallChecker(interface, self.host, self.args.dcom_timeout, self.logger)
             if not flag or not binding:
                 raise RuntimeError("WMI DCOM binding unavailable; check connectivity and dcom_timeout")
             services = login.NTLMLogin(namespace, NULL, NULL)

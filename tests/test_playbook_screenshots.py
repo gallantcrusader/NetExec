@@ -50,6 +50,7 @@ def test_capture_routine_creates_directory_and_cleans_up(tmp_path, monkeypatch, 
     monkeypatch.setattr(module, "NXC_PATH", tmp_path)
     monkeypatch.setattr(module.asyncio, "sleep", AsyncMock())
     fake = SimpleNamespace(conn=None, auth=object(), credential=object(), target=object(), iosettings=object(), host="offline.invalid", hostname="desktop", logger=Mock(), playbook_mode=True, args=SimpleNamespace(screentime=0, vnc_timeout=2), connect_rdp=AsyncMock(), connect_vnc=AsyncMock(), terminate_conn=AsyncMock())
+    fake._create_rdp_connection = lambda *args, **kwargs: conn
     fake.screen = lambda: getattr(module, protocol).screen(fake)
     result = getattr(module, protocol).screenshot(fake)
     assert result.data.captured is has_frame

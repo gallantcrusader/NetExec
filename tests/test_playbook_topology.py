@@ -28,7 +28,7 @@ def ldap_entry(**attributes):
     ("10", "incomplete search", ResultStatus.FAILED),
 ])
 def test_quota_result(quota, error, status):
-    connection = SimpleNamespace(host="dc.example.test", last_search_error=error)
+    connection = SimpleNamespace(host="dc.example.test", last_search_error=error, baseDN="DC=example,DC=test")
     connection.search = Mock(return_value=[ldap_entry(**{"ms-DS-MachineAccountQuota": quota})] if quota is not None else [])
     module = maq.NXCModule()
     result = module.on_login(SimpleNamespace(log=Mock()), connection)
