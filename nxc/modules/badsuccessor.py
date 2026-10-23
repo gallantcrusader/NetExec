@@ -1,73 +1,11 @@
+from dataclasses import dataclass, field
+
 from impacket.ldap import ldaptypes
-from nxc.helpers.misc import CATEGORY
-from nxc.parsers.ldap_results import parse_result_attributes
 from ldap3.protocol.microsoft import security_descriptor_control
 
-RELEVANT_OBJECT_TYPES = {
-    "00000000-0000-0000-0000-000000000000": "All Objects",
-    "0feb936f-47b3-49f2-9386-1dedc2c23765": "msDS-DelegatedManagedServiceAccount",
-}
-
-EXCLUDED_SIDS_SUFFIXES = ["-512", "-519"]  # Domain Admins, Enterprise Admins
-EXCLUDED_SIDS = ["S-1-5-32-544", "S-1-5-18"]  # Builtin Administrators, Local SYSTEM
-
-# Define all access rights
-ACCESS_RIGHTS = {
-    # Generic Rights
-    "GenericRead": 0x80000000,  # ADS_RIGHT_GENERIC_READ
-    "GenericWrite": 0x40000000,  # ADS_RIGHT_GENERIC_WRITE
-    "GenericExecute": 0x20000000,  # ADS_RIGHT_GENERIC_EXECUTE
-    "GenericAll": 0x10000000,  # ADS_RIGHT_GENERIC_ALL
-
-    # Maximum Allowed access type
-    "MaximumAllowed": 0x02000000,
-
-    # Access System Acl access type
-    "AccessSystemSecurity": 0x01000000,  # ADS_RIGHT_ACCESS_SYSTEM_SECURITY
-
-    # Standard access types
-    "Synchronize": 0x00100000,  # ADS_RIGHT_SYNCHRONIZE
-    "WriteOwner": 0x00080000,  # ADS_RIGHT_WRITE_OWNER
-    "WriteDACL": 0x00040000,  # ADS_RIGHT_WRITE_DAC
-    "ReadControl": 0x00020000,  # ADS_RIGHT_READ_CONTROL
-    "Delete": 0x00010000,  # ADS_RIGHT_DELETE
-
-    # Specific rights
-    "AllExtendedRights": 0x00000100,  # ADS_RIGHT_DS_CONTROL_ACCESS
-    "ListObject": 0x00000080,  # ADS_RIGHT_DS_LIST_OBJECT
-    "DeleteTree": 0x00000040,  # ADS_RIGHT_DS_DELETE_TREE
-    "WriteProperties": 0x00000020,  # ADS_RIGHT_DS_WRITE_PROP
-    "ReadProperties": 0x00000010,  # ADS_RIGHT_DS_READ_PROP
-    "Self": 0x00000008,  # ADS_RIGHT_DS_SELF
-    "ListChildObjects": 0x00000004,  # ADS_RIGHT_ACTRL_DS_LIST
-    "DeleteChild": 0x00000002,  # ADS_RIGHT_DS_DELETE_CHILD
-    "CreateChild": 0x00000001,  # ADS_RIGHT_DS_CREATE_CHILD
-}
-
-# Define which rights are considered relevant for potential abuse
-RELEVANT_RIGHTS = {
-    "GenericAll": ACCESS_RIGHTS["GenericAll"],
-    "GenericWrite": ACCESS_RIGHTS["GenericWrite"],
-    "WriteOwner": ACCESS_RIGHTS["WriteOwner"],
-    "WriteDACL": ACCESS_RIGHTS["WriteDACL"],
-    "CreateChild": ACCESS_RIGHTS["CreateChild"],
-    "WriteProperties": ACCESS_RIGHTS["WriteProperties"],
-    "AllExtendedRights": ACCESS_RIGHTS["AllExtendedRights"]
-}
-
-FUNCTIONAL_LEVELS = {
-    "Windows 2000": 0,
-    "Windows Server 2003": 1,
-    "Windows Server 2003 R2": 2,
-    "Windows Server 2008": 3,
-    "Windows Server 2008 R2": 4,
-    "Windows Server 2012": 5,
-    "Windows Server 2012 R2": 6,
-    "Windows Server 2016": 7,
-    "Windows Server 2019": 8,
-    "Windows Server 2022": 9,
-    "Windows Server 2025": 10,
-}
+from nxc.helpers.misc import CATEGORY
+from nxc.parsers.ldap_results import parse_result_attributes
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -82,17 +20,98 @@ class NXCModule:
     supported_protocols = ["ldap"]
     category = CATEGORY.ENUMERATION
 
-    def __init__(self):
-        self.context = None
-        self.module_options = None
+    RELEVANT_OBJECT_TYPES = {
+        "00000000-0000-0000-0000-000000000000": "All Objects",
+        "0feb936f-47b3-49f2-9386-1dedc2c23765": "msDS-DelegatedManagedServiceAccount",
+    }
+
+    EXCLUDED_SIDS_SUFFIXES = ["-512", "-519"]  # Domain Admins, Enterprise Admins
+    EXCLUDED_SIDS = ["S-1-5-32-544", "S-1-5-18"]  # Builtin Administrators, Local SYSTEM
+
+    # Define all access rights
+    ACCESS_RIGHTS = {
+        # Generic Rights
+        "GenericRead": 0x80000000,  # ADS_RIGHT_GENERIC_READ
+        "GenericWrite": 0x40000000,  # ADS_RIGHT_GENERIC_WRITE
+        "GenericExecute": 0x20000000,  # ADS_RIGHT_GENERIC_EXECUTE
+        "GenericAll": 0x10000000,  # ADS_RIGHT_GENERIC_ALL
+
+        # Maximum Allowed access type
+        "MaximumAllowed": 0x02000000,
+
+        # Access System Acl access type
+        "AccessSystemSecurity": 0x01000000,  # ADS_RIGHT_ACCESS_SYSTEM_SECURITY
+
+        # Standard access types
+        "Synchronize": 0x00100000,  # ADS_RIGHT_SYNCHRONIZE
+        "WriteOwner": 0x00080000,  # ADS_RIGHT_WRITE_OWNER
+        "WriteDACL": 0x00040000,  # ADS_RIGHT_WRITE_DAC
+        "ReadControl": 0x00020000,  # ADS_RIGHT_READ_CONTROL
+        "Delete": 0x00010000,  # ADS_RIGHT_DELETE
+
+        # Specific rights
+        "AllExtendedRights": 0x00000100,  # ADS_RIGHT_DS_CONTROL_ACCESS
+        "ListObject": 0x00000080,  # ADS_RIGHT_DS_LIST_OBJECT
+        "DeleteTree": 0x00000040,  # ADS_RIGHT_DS_DELETE_TREE
+        "WriteProperties": 0x00000020,  # ADS_RIGHT_DS_WRITE_PROP
+        "ReadProperties": 0x00000010,  # ADS_RIGHT_DS_READ_PROP
+        "Self": 0x00000008,  # ADS_RIGHT_DS_SELF
+        "ListChildObjects": 0x00000004,  # ADS_RIGHT_ACTRL_DS_LIST
+        "DeleteChild": 0x00000002,  # ADS_RIGHT_DS_DELETE_CHILD
+        "CreateChild": 0x00000001,  # ADS_RIGHT_DS_CREATE_CHILD
+    }
+
+    # Define which rights are considered relevant for potential abuse
+    RELEVANT_RIGHTS = {
+        "GenericAll": ACCESS_RIGHTS["GenericAll"],
+        "GenericWrite": ACCESS_RIGHTS["GenericWrite"],
+        "WriteOwner": ACCESS_RIGHTS["WriteOwner"],
+        "WriteDACL": ACCESS_RIGHTS["WriteDACL"],
+        "CreateChild": ACCESS_RIGHTS["CreateChild"],
+        "WriteProperties": ACCESS_RIGHTS["WriteProperties"],
+        "AllExtendedRights": ACCESS_RIGHTS["AllExtendedRights"]
+    }
+
+    FUNCTIONAL_LEVELS = {
+        "Windows 2000": 0,
+        "Windows Server 2003": 1,
+        "Windows Server 2003 R2": 2,
+        "Windows Server 2008": 3,
+        "Windows Server 2008 R2": 4,
+        "Windows Server 2012": 5,
+        "Windows Server 2012 R2": 6,
+        "Windows Server 2016": 7,
+        "Windows Server 2019": 8,
+        "Windows Server 2022": 9,
+        "Windows Server 2025": 10,
+    }
+
+    @dataclass
+    class Principal:
+        """One non-privileged SID able to create/control dMSA objects in some OU(s)."""
+
+        sid: str
+        name: str
+        ous: list[str] = field(default_factory=list)
+
+    @dataclass
+    class ResultData:
+        server_2025_present: bool = False
+        server_2025_dcs: list[str] = field(default_factory=list)
+        organizational_units: int = 0
+        principals: list = field(default_factory=list)  # list[Principal]
+        vulnerable: bool = False
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """No options available"""
 
     def is_excluded_sid(self, sid, domain_sid):
-        if sid in EXCLUDED_SIDS:
+        if sid in self.EXCLUDED_SIDS:
             return True
-        return any(sid.startswith(domain_sid) and sid.endswith(suffix) for suffix in EXCLUDED_SIDS_SUFFIXES)
+        domain_sid = domain_sid or ""
+        return any(sid.startswith(domain_sid) and sid.endswith(suffix) for suffix in self.EXCLUDED_SIDS_SUFFIXES)
 
     def get_domain_sid(self):
         """Retrieve the domain SID from the domain object in LDAP"""
@@ -119,7 +138,7 @@ class NXCModule:
 
                 has_relevant_right = False
                 mask = int(ace["Ace"]["Mask"]["Mask"])
-                for right_value in RELEVANT_RIGHTS.values():
+                for right_value in self.RELEVANT_RIGHTS.values():
                     if mask & right_value:
                         has_relevant_right = True
                         break
@@ -130,7 +149,7 @@ class NXCModule:
                 object_type = getattr(ace, "ObjectType", None)
                 if object_type:
                     object_guid = ldaptypes.bin_to_string(object_type).lower()
-                    if object_guid not in RELEVANT_OBJECT_TYPES:
+                    if object_guid not in self.RELEVANT_OBJECT_TYPES:
                         continue
 
                 sid = ace["Ace"]["Sid"].formatCanonical()
@@ -173,30 +192,33 @@ class NXCModule:
 
     def on_login(self, context, connection):
         self.connection = connection
+        data = self.ResultData()
 
-        # Check for a domain controller with Windows Server 2025
+        # Check for a domain controller with Windows Server 2025; dMSA (and the
+        # BadSuccessor abuse) require a Server 2025 DC.
         resp = self.connection.search(
             searchFilter="(&(objectCategory=computer)(primaryGroupId=516))",
             attributes=["operatingSystem", "dNSHostName"]
         )
-        parsed_resp = parse_result_attributes(resp)
-
-        for dc in parsed_resp:
-            if "2025" in dc["operatingSystem"]:
+        for dc in parse_result_attributes(resp):
+            if "2025" in dc.get("operatingSystem", ""):
                 out = connection.resolver(dc["dNSHostName"])
                 dc_ip = out["host"] if out else "Unknown IP"
+                data.server_2025_dcs.append(dc["dNSHostName"])
                 context.log.success(f"Found domain controller with operating system Windows Server 2025: {dc_ip} ({dc['dNSHostName']})")
-            else:
-                context.log.fail("No domain controller with operating system Windows Server 2025 found, attack not possible. Enumerate dMSA objects anyway.")
+        data.server_2025_present = bool(data.server_2025_dcs)
+        if not data.server_2025_present:
+            context.log.fail("No domain controller with operating system Windows Server 2025 found, attack not possible. Enumerate dMSA objects anyway.")
 
-        # Enumerate dMSA objects
+        # Enumerate OUs and find non-privileged principals able to create/control
+        # a dMSA there (the BadSuccessor precondition).
         controls = security_descriptor_control(sdflags=0x07)  # OWNER_SECURITY_INFORMATION
         resp = self.connection.search(
             searchFilter="(objectClass=organizationalUnit)",
             attributes=["distinguishedName", "nTSecurityDescriptor"],
             searchControls=controls
         )
-
+        data.organizational_units = len(resp)
         context.log.debug(f"Found {len(resp)} entries")
 
         results = self.find_bad_successor_ous(resp)
@@ -208,9 +230,14 @@ class NXCModule:
 
         for sid, ous in results.items():
             samaccountname = self.resolve_sid_to_name(sid)
+            data.principals.append(self.Principal(sid=sid, name=samaccountname, ous=list(ous)))
 
             for ou in ous:
                 if sid == samaccountname:
                     context.log.highlight(f"{sid}, {ou}")
                 else:
                     context.log.highlight(f"{samaccountname} ({sid}), {ou}")
+
+        data.vulnerable = data.server_2025_present and bool(data.principals)
+        status = ResultStatus.SUCCESS if data.principals else ResultStatus.NEGATIVE
+        return ActionResult("ldap", self.name, connection.host, status, data)

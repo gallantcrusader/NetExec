@@ -36,12 +36,23 @@ SMB shares are spidered and fully downloaded. Nothing is exploited.
   - `teaching/mssql/` — `query_rows`, `linked_servers`
   - `teaching/patterns/` — cross-cutting patterns: `stop_on_error_defaults`,
     `evidence_and_finding`, `cross_host_credential_reuse`
-- **`chains/`** — full, multi-step attack chains against the GOAD lab. Each has a
-  one-page cookbook in [`docs/cookbooks/`](../../docs/cookbooks):
+- **`chains/`** — full, multi-step chains, each with a one-page cookbook in
+  [`docs/cookbooks/`](../../docs/cookbooks). The `goad_*` chains run against the
+  GOAD lab; `ad_hardening_posture.py` is target-agnostic:
   - `goad_cross_host_sql.py` → [cross-host-sql](../../docs/cookbooks/cross-host-sql.md)
   - `goad_laps_path.py` → [laps-to-local-admin](../../docs/cookbooks/laps-to-local-admin.md)
   - `goad_khal_ca_path.py` → [adcs-esc4-ca-path](../../docs/cookbooks/adcs-esc4-ca-path.md)
   - `goad_acl_chain.py` → [acl-escalation-chain](../../docs/cookbooks/acl-escalation-chain.md)
+  - `ad_hardening_posture.py` → [ad-hardening-posture](../../docs/cookbooks/ad-hardening-posture.md)
+    — detection-only signing / channel-binding / coercion report against any DC or host
+  - `rbcd_takeover.py` → [rbcd-takeover](../../docs/cookbooks/rbcd-takeover.md)
+    — active RBCD chain (rbcd read → delegation S4U → Kerberos verify); env-configured
+  - `badsuccessor.py` → [badsuccessor](../../docs/cookbooks/badsuccessor.md)
+    — detection-only dMSA/BadSuccessor exposure; reports whether the current principal can abuse it
+  - `shadow_credentials.py` → [shadow-credentials](../../docs/cookbooks/shadow-credentials.md)
+    — detection-first Shadow Credentials (lists existing); active KeyCredential write opt-in (NXC_SHADOW_WRITE=1), PFX handed off to external PKINIT
+  - `adcs_esc.py` → [adcs-esc](../../docs/cookbooks/adcs-esc.md)
+    — detection-only AD CS ESC survey (adcs + enum_ca ESC8 + certipy-find ESC1–16 JSON) into one typed verdict
 - **`verify/`** — reconciliation / inventory playbooks that check the deployed
   GOAD configuration against live state (ACLs, group membership, LAPS, SQL
   impersonation, ADCS, offline graph joins). Their JSON manifests live beside

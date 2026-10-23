@@ -253,6 +253,7 @@ netexec ldap TARGET_HOST {DNS} -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M t
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M get-network
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M groupmembership -o USER=LOGIN_USERNAME
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M laps
+netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M badsuccessor
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M maq
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M modify-group -o USER=USERNAME GROUP="Domain Admins"
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M modify-group -o USER=USERNAME GROUP="Domain Admins" REMOVE=True
@@ -265,6 +266,7 @@ netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M dump-co
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M raisechild
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M get-scriptpath
 # Backup followed by revert restores the same Shadow Credentials state on the disposable test computer.
+netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M shadow-creds -o TARGET=COMPUTER$ ACTION=list
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M shadow-creds -o TARGET=CASTELBLACK$ ACTION=list
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M shadow-creds -o TARGET=CASTELBLACK$ ACTION=backup JSONFILE=nxc-shadow-creds-castelblack.json
 netexec ldap TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M shadow-creds -o TARGET=CASTELBLACK$ ACTION=revert JSONFILE=nxc-shadow-creds-castelblack.json
@@ -408,6 +410,8 @@ UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playboo
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc smb -M runasppl --options
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc smb -M install_elevated --options
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc ldap -M dump-computers --options
+UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc ldap -M badsuccessor --options
+UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc ldap -M shadow-creds --options
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc ldap -M find-computer --options
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc mssql -M enum_links --options
 UV_CACHE_DIR=/private/tmp/netexec-uv-cache NXC_PATH=/private/tmp/netexec-playbook-tests uv run --no-sync nxc mssql -M enum_logins --options

