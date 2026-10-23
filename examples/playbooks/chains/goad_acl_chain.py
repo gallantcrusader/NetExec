@@ -7,7 +7,6 @@ It does not execute transitions. Full ordered descriptors remain in results.
 from dataclasses import dataclass, field
 
 from nxc.playbooks.access import assess_dacl
-from nxc.playbooks.results import ActionResult, ResultStatus
 
 
 @dataclass
@@ -59,4 +58,4 @@ def run(host):
         for obj in result.data.objects:
             edge["assessments"].append({"dn": obj["dn"], "dacl": assess_dacl(obj["descriptor"], [*groups.data.directory_sids, *edge["assumed_logon_sids"]], masks[0], object_type=guid, target_sid=obj["sid"])})
     data.candidate_chain_present = all(edge["matching_aces"] for edge in data.edges)
-    host.record(ActionResult("ldap", "goad_acl_chain", host.target, ResultStatus.SUCCESS if data.candidate_chain_present else ResultStatus.NEGATIVE, data))
+    host.finding("goad_acl_chain", ok=data.candidate_chain_present, data=data, protocol="ldap")

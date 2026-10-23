@@ -53,6 +53,8 @@ SMB shares are spidered and fully downloaded. Nothing is exploited.
     — detection-first Shadow Credentials (lists existing); active KeyCredential write opt-in (NXC_SHADOW_WRITE=1), PFX handed off to external PKINIT
   - `adcs_esc.py` → [adcs-esc](../../docs/cookbooks/adcs-esc.md)
     — detection-only AD CS ESC survey (adcs + enum_ca ESC8 + certipy-find ESC1–16 JSON) into one typed verdict
+  - `coercion_survey.py` → [coercion-survey](../../docs/cookbooks/coercion-survey.md)
+    — detection-first coercion matrix (coerce_plus SMB vectors, no listener) + SMB-signing relay context; active MSSQL vector gated behind NXC_COERCE_LISTENER
 - **`verify/`** — reconciliation / inventory playbooks that check the deployed
   GOAD configuration against live state (ACLs, group membership, LAPS, SQL
   impersonation, ADCS, offline graph joins). Their JSON manifests live beside
