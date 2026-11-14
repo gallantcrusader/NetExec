@@ -1,5 +1,6 @@
 """Offline screenshot artifacts and status handling."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from pathlib import Path
@@ -21,7 +22,7 @@ def test_screenshot_action_returns_artifact(tmp_path, protocol, outcome):
     if outcome == "failure":
         capture.side_effect = OSError("capture failed")
     module = ProtocolLoader().load_protocol(f"nxc/protocols/{protocol}.py")
-    fake = SimpleNamespace(playbook_mode=True, host="offline.invalid", screen=capture)
+    fake = SimpleNamespace(playbook_mode=True, host="offline.invalid", screen=capture, username="alice", runner=SimpleNamespace(run=asyncio.run))
     result = getattr(module, protocol).screenshot(fake)
     expected = ResultStatus.SUCCESS if outcome == "saved" else ResultStatus.NEGATIVE if outcome == "empty" else ResultStatus.FAILED
     assert result.status is expected
@@ -49,16 +50,18 @@ def test_capture_routine_creates_directory_and_cleans_up(tmp_path, monkeypatch, 
     monkeypatch.setattr(module, "RDPConnection" if protocol == "rdp" else "VNCConnection", Mock(return_value=conn))
     monkeypatch.setattr(module, "NXC_PATH", tmp_path)
     monkeypatch.setattr(module.asyncio, "sleep", AsyncMock())
-    fake = SimpleNamespace(conn=None, auth=object(), credential=object(), target=object(), iosettings=object(), host="offline.invalid", hostname="desktop", logger=Mock(), playbook_mode=True, args=SimpleNamespace(screentime=0, vnc_timeout=2), connect_rdp=AsyncMock(), connect_vnc=AsyncMock(), terminate_conn=AsyncMock())
+    fake = SimpleNamespace(conn=conn if protocol == "rdp" else None, username="alice", runner=SimpleNamespace(run=asyncio.run), auth=object(), credential=object(), target=object(), iosettings=object(), host="offline.invalid", hostname="desktop", logger=Mock(), playbook_mode=True, args=SimpleNamespace(screentime=0, vnc_timeout=2), connect_rdp=AsyncMock(), connect_vnc=AsyncMock(), terminate_conn=AsyncMock())
     fake._create_rdp_connection = lambda *args, **kwargs: conn
     fake.screen = lambda: getattr(module, protocol).screen(fake)
+    fake.save_screenshot = lambda desktop, label: module.rdp.save_screenshot(fake, desktop, label)
     result = getattr(module, protocol).screenshot(fake)
     assert result.data.captured is has_frame
     if has_frame:
         assert result.data.path.parent == tmp_path / "screenshots"
         assert result.data.path.read_bytes() == b"mock screenshot"
     if protocol == "rdp":
-        fake.terminate_conn.assert_awaited_once()
+        # RDP captures the logged-in session, which stays open for later actions
+        fake.terminate_conn.assert_not_awaited()
     else:
         conn.terminate.assert_awaited_once()
 
@@ -69,9 +72,11 @@ def test_nla_capture_restores_auth_and_negotiation(tmp_path, failure):
     auth = object()
     path = tmp_path / "nla.png"
     path.write_bytes(b"mock screenshot")
-    fake = SimpleNamespace(nla=False, auth=auth, iosettings=SimpleNamespace(supported_protocols="original"), playbook_mode=True, host="offline.invalid")
+    session = object()
+    fake = SimpleNamespace(nla=False, conn=session, auth=auth, iosettings=SimpleNamespace(supported_protocols="original"), playbook_mode=True, host="offline.invalid", runner=SimpleNamespace(run=asyncio.run))
 
     def capture():
+        fake.conn = "probe"
         fake.auth = "anonymous"
         fake.iosettings.supported_protocols = "temporary"
         if failure:
@@ -83,6 +88,7 @@ def test_nla_capture_restores_auth_and_negotiation(tmp_path, failure):
     assert result.action == "nla_screenshot"
     assert result.status is (ResultStatus.FAILED if failure else ResultStatus.SUCCESS)
     assert fake.auth is auth
+    assert fake.conn is session
     assert fake.iosettings.supported_protocols == "original"
 
 

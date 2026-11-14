@@ -25,7 +25,7 @@ def test_smb_wmi_query_retains_records_and_releases_resources(monkeypatch, failu
     monkeypatch.setattr(protocol, "DCOMConnection", Mock(return_value=dcom))
     monkeypatch.setattr(protocol, "IWbemLevel1Login", Mock(return_value=login))
     monkeypatch.setattr(protocol, "dcom_FirewallChecker", Mock(return_value=(failure != "binding", "binding")))
-    fake = SimpleNamespace(admin_privs=True, playbook_mode=True, args=SimpleNamespace(wmi_query="SELECT Name FROM Example", wmi_namespace="root/cimv2", dcom_timeout=5), host="offline.invalid", remoteName="offline.invalid", username="alice", password="example", domain="EXAMPLE", lmhash="", nthash="", kerberos=False, kdcHost=None, aesKey=None, logger=Mock())
+    fake = SimpleNamespace(admin_privs=True, playbook_mode=True, args=SimpleNamespace(wmi_query="SELECT Name FROM Example", wmi_namespace="root/cimv2", dcom_timeout=5), host="offline.invalid", remoteName="offline.invalid", username="alice", password="example", domain="EXAMPLE", lmhash="", nthash="", kerberos=False, kdcHost=None, aesKey=None, logger=Mock(), conn=Mock(getCredentials=Mock(return_value=("alice", "example", "EXAMPLE", "", "", None, None, None))))
     result = protocol.smb.wmi_query(fake, "SELECT Name FROM Example") if explicit else protocol.smb.wmi_query(fake)
     records = result if explicit else result.data.records
     if not explicit:

@@ -99,7 +99,7 @@ class NXCModule:
                 self.dce = self.authenticate(context, connection, protocol="ncacn_np", anonymous=False)
             except Exception as e:
                 if any(code in str(e) for code in ("STATUS_PASSWORD_MUST_CHANGE", "STATUS_PASSWORD_EXPIRED",
-                                                    "STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT")):
+                                                    "STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT", "STATUS_USER_SESSION_DELETED")):
                     context.log.info("Password change requires a null-session SAMR connection")
                     self.dce = self.authenticate(context, connection, protocol="ncacn_ip_tcp", anonymous=True)
                 else:

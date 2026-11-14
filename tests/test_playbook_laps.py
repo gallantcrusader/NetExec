@@ -27,7 +27,7 @@ def run_module(rows, options=None, error=None):
     module = laps.NXCModule()
     context = SimpleNamespace(log=RecordingLogger(Mock()))
     module.options(context, options or {})
-    connection = SimpleNamespace(host="192.0.2.12", search=Mock(return_value=rows), last_search_error=error, username="reader", password="secret", domain="essos.local", nthash="", kerberos=False, kdcHost=None, dns_server="192.0.2.12")
+    connection = SimpleNamespace(host="192.0.2.12", search=Mock(return_value=rows), last_search_error=error, username="reader", password="secret", domain="essos.local", nthash="", kerberos=False, kdcHost=None, dns_server="192.0.2.12", remoteName="braavos.essos.local", aesKey=None)
     result = module.on_login(context, connection)
     validate_module_result(module, result, "ldap", connection.host)
     return result, connection

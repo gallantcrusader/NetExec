@@ -43,7 +43,7 @@ class NXCModule:
         """Decode the password payload after ordinary LDAP attribute parsing."""
         if "mslaps-encryptedpassword" in values:
             record.source = "msLAPS-EncryptedPassword"
-            payload = LAPSv2Extract(values["mslaps-encryptedpassword"], connection.username or "", connection.password or "", connection.domain, connection.nthash or "", connection.kerberos, connection.kdcHost, 339, connection.dns_server).run()
+            payload = LAPSv2Extract(values["mslaps-encryptedpassword"], connection.username or "", connection.password or "", connection.domain, connection.nthash or "", connection.kerberos, connection.kdcHost, 339, connection.dns_server, connection.host, connection.remoteName, connection.aesKey).run()
             if not payload:
                 raise ValueError("Encrypted LAPS password could not be decrypted")
         elif "mslaps-password" in values:

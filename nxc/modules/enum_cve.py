@@ -43,23 +43,21 @@ class NXCModule:
         - CVE-2026-54121 (Certighost)
         - CVE-2026-27912 (ResetNightmare)
         - CVE-2026-102217 (PetitPotam WebDAV coercion)
+        - KB5126646 (LDAP Signing Bypass, no CVE assigned)
 
-        CVE             Filter for specific CVE number (default: All)
+        CVE             Filter for a specific CVE/KB identifier from the list above (default: All)
         EXPLOITATION    Also provide sources for exploitation details (default: False)
         """
-        self.listener = None
-        if "CVE" in module_options:
-            self.cve = module_options["CVE"].lower()
-        if "EXPLOITATION" in module_options:
-            self.exploitation_details = str(module_options["EXPLOITATION"]).lower() in ["true", "1", "yes"]
+        self.cve = module_options.get("CVE", "all").lower()
+        if self.cve != "all" and self.cve not in [cve.lower() for cve in self.CVE_PATCHES]:
+            context.log.fail(f"Unknown CVE '{module_options['CVE']}', supported identifiers: {', '.join(self.CVE_PATCHES)}")
+            return False
+        self.exploitation_details = str(module_options.get("EXPLOITATION", "false")).lower() in ["true", "1", "yes"]
 
-    def is_vulnerable(self, major, minor, build, ubr, msrc):
-        key = (major, minor, build)
-        min_patched_ubr = msrc.get(key)
+    def is_vulnerable(self, os_key, ubr, msrc):
+        min_patched_ubr = msrc.get(os_key)
         if min_patched_ubr is None:
             return None  # Unknown product
-        if ubr is None:
-            return None
         return ubr < min_patched_ubr
 
     def on_login(self, context, connection):
@@ -263,5 +261,21 @@ class NXCModule:
             },
             "message": "PetitPotam (EFSRPC) can coerce to a WebDAV listener, the HTTP authentication can be relayed to LDAP/LDAPS",
             "exploitation": "https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/webclient",
+        },
+        # https://support.microsoft.com/en-us/servicing/os/azure-marketplace/windows-server/2026/windows-server-images-for-october-2026
+        "KB5126646": {
+            "alias": "LDAP Signing Bypass",
+            "dc_only": True,
+            "patches": {
+                (6, 2, 9200): 26434,      # Windows Server 2012
+                (6, 3, 9600): 23470,      # Windows Server 2012 R2
+                (10, 0, 14393): 9612,     # Windows Server 2016
+                (10, 0, 17763): 9376,     # Windows Server 2019
+                (10, 0, 20348): 5756,     # Windows Server 2022
+                (10, 0, 25398): 2331,     # Windows Server 2022 23H2 (EOL)
+                (10, 0, 26100): 33648,    # Windows Server 2025
+            },
+            "message": "SMB-to-LDAP NTLM relay is possible even when LDAP signature is required",
+            "exploitation": "https://specterops.io/blog/2026/10/23/ldap-signing-bypass-ntlm-relay/",
         },
     }

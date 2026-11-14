@@ -122,9 +122,11 @@ class connection:
         self.username = ""
         self.authenticated_credential_type = None
         self.authenticated_secret = None
+        self.certificate_auth = bool(self.args.pfx_cert or self.args.pfx_base64 or self.args.pem_cert)
         self.kerberos = bool(self.args.kerberos or
                              self.args.use_kcache or
                              self.args.aesKey or
+                             (self.certificate_auth and not (self.protocol == "ldap" and self.args.schannel)) or   # PKINIT yields a TGT, while Schannel binds the certificate to the LDAP channel itself
                              (hasattr(self.args, "delegate") and self.args.delegate) or
                              (hasattr(self.args, "generate_st") and self.args.generate_st) or
                              (hasattr(self.args, "no_preauth_targets") and self.args.no_preauth_targets))
@@ -244,7 +246,7 @@ class connection:
             self.output_filename = os.path.join(base_log_dir, filename_pattern)
 
             self.print_host_info()
-            if self.login() or (self.username == "" and self.password == "" and self.protocol != "mssql"):
+            if self.login() or (self.username == "" and self.password == "" and self.protocol != "mssql" and not self.certificate_auth):   # a failed certificate auth is not a null session
                 self.logger.debug("Calling command arguments")
                 self.call_cmd_args()
                 if self.args.module:
@@ -270,7 +272,7 @@ class connection:
         self.print_host_info()
         authenticated = self.login()
         successful_login = bool(authenticated or self.authenticated_credential_type)
-        self.session_open = successful_login if anonymous else bool(successful_login or (self.username == "" and self.password == "" and self.protocol != "mssql"))
+        self.session_open = successful_login if anonymous else bool(successful_login or (self.username == "" and self.password == "" and self.protocol != "mssql" and not self.certificate_auth))
         return self.session_open
 
     def close_session(self):
@@ -634,18 +636,18 @@ class connection:
                     self.logger.info("Successfully authenticated using Kerberos cache")
                 return authenticated
 
-        if self.args.pfx_cert or self.args.pfx_base64 or self.args.pem_cert:
+        if self.certificate_auth:
             self.logger.debug("Trying to authenticate using Certificate pfx")
             if self.args.protocol == "ldap" and self.args.schannel:
                 # Schannel maps the certificate to an account server-side, so the supplied username is ignored
                 with sem:
                     return self.plaintext_login(self.domain, "", "")
-            if not self.args.username:
+            if not username:
                 self.logger.fail("You must specify a username when using certificate authentication")
                 return False
             with sem:
                 from nxc.helpers.pfx import pfx_auth
-                authenticated = pfx_auth(self)
+                authenticated = pfx_auth(self, domain[0], username[0])
                 if authenticated:
                     self.authenticated_credential_type = "certificate"
                 return authenticated

@@ -840,7 +840,8 @@ class ldap(connection):
                 self.logger.debug(f"Search Filter={searchFilter}")
 
                 # Microsoft Active Directory set an hard limit of 1000 entries returned by any search
-                paged_search_control = [ldapasn1_impacket.SimplePagedResultsControl(criticality=True, size=1000)] if not self.no_ntlm else ""
+                # A baseObject search returns one entry at most, and AD refuses the paged control on an anonymous rootDSE read
+                paged_search_control = [ldapasn1_impacket.SimplePagedResultsControl(criticality=True, size=1000)] if self.scope is None else None
                 return self.ldap_connection.search(
                     scope=self.scope,
                     searchBase=baseDN,
@@ -1823,7 +1824,7 @@ class ldap(connection):
         Get the Fine Grained Password Policy/PSOs
         Initial FGPP/PSO script written by @n00py: https://github.com/n00py/GetFGPP
         """
-        # Convert LDAP time to human readable format
+        # Convert LDAP time (100ns intervals) to human readable format
         def pso_days(ldap_time):
             return f"{abs(int(ldap_time)) / 864000000000:g} days" if ldap_time != "" else ""
 
@@ -2089,7 +2090,7 @@ class ldap(connection):
             if self.args.kerberos:
                 self.logger.highlight("Using kerberos auth without ccache, getting TGT")
                 auth.get_tgt()
-            if self.args.use_kcache:
+            if self.use_kcache:
                 self.logger.highlight("Using kerberos auth from ccache")
                 auth.load_ccache()
 

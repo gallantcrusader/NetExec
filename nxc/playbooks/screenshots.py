@@ -13,9 +13,9 @@ class ScreenshotData:
     captured: bool
 
 
-def capture_screenshot(protocol, action, target, capture):
+def capture_screenshot(protocol, action, target, capture, run=asyncio.run):
     try:
-        filename = asyncio.run(capture())
+        filename = run(capture())
         path = Path(str(filename)) if filename is not None else None
         if path is not None and not path.is_file():
             raise OSError(f"Screenshot capture did not create {path}")

@@ -77,11 +77,8 @@ def test_errors_and_partial_observations(registry, failure):
     registry.disconnect.assert_called_once_with()
 
 
-def test_unknown_cve_does_not_open_registry(registry):
+def test_unknown_cve_is_rejected_in_options(registry):
     module = code.NXCModule()
-    module.options(None, {"CVE": "unknown"})
-    conn = connection()
-    result = module.on_login(SimpleNamespace(log=Mock()), conn)
-    assert result.status is ResultStatus.FAILED
-    conn.trigger_winreg.assert_not_called()
-    assert result.data.checks == []
+    context = SimpleNamespace(log=Mock())
+    assert module.options(context, {"CVE": "unknown"}) is False
+    context.log.fail.assert_called_once()
